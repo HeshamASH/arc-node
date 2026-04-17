@@ -322,9 +322,7 @@ where
         transaction: &Tx,
         state_provider: &dyn StateProvider,
     ) -> ProviderResult<Option<Address>> {
-        let has_value = !transaction.value().is_zero();
-        let addresses =
-            std::iter::once(transaction.sender()).chain(transaction.to().filter(|_| has_value));
+        let addresses = std::iter::once(transaction.sender()).chain(transaction.to());
 
         for address in addresses {
             if self.is_address_blocklisted(address, state_provider)? {
@@ -472,7 +470,7 @@ mod tests {
                     .with_value(U256::ZERO),
                 sender_blocklisted: false,
                 to_blocklisted: true,
-                expected_outcome: ExpectedOutcome::Valid,
+                expected_outcome: ExpectedOutcome::Invalid,
             },
         ];
 
