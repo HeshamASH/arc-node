@@ -1,83 +1,75 @@
-Title:         Consensus State Corruption & Non-Determinism via Gas History Slot Aliasing
+Title:         Network Halt via Mempool / Block Builder Gas Validation Asymmetry (Zero6 Hardfork)
 Scope:         https://github.com/circlefin/arc-node
-Weakness:      Improper Preservation of Consistency Between Independent Representations of Shared State
-Severity:      Critical (10.0)
+Weakness:      Uncontrolled Resource Consumption
+Severity:      Critical (9.3)
 Link:
 Date:          2026-04-17 12:00:00 +0000
 By:            Sentinel
 CVE IDs:
 Details:
 ## Summary
-The Arc Network is vulnerable to a **Critical Consensus Failure** caused by an architectural flaw in how historical gas statistics are stored. The `SystemAccounting` precompile utilizes a ring-buffer strategy that causes multiple distinct block heights to alias to the same physical storage slot in the state trie.
-This aliasing allows an attacker—or even normal network volatility—to cause permanent state corruption. Because the "Smoothed Gas Used" and "Base Fee" are state-dependent, any disagreement in these values across validators will result in different state roots, leading to a total network partition (Hard Fork) and loss of consensus.
+The Arc Network is vulnerable to a targeted **Denial of Service (DoS) and Network Halt** due to a gas validation asymmetry between the Transaction Pool (Mempool) and the Block Builder (Executor).
+
+Under the Zero6 hardfork, the core execution engine (`ArcEvmHandler::validate_initial_tx_gas`) adds an extra 2,100 to 4,200 gas (1-2 `PRECOMPILE_SLOAD_GAS_COST`) to the intrinsic gas cost of transactions to account for state blocklist checks. However, the `ArcTransactionValidator` in `crates/execution-txpool/src/validator.rs` does not include these additional costs when performing mempool validation.
+
+An attacker can flood the network with standard native coin transfers (e.g., 21,000 gas limit). The mempool will evaluate the transactions as perfectly valid and include them in the transaction payload. During block assembly (`execute_transaction_without_commit` in `crates/evm/src/executor.rs`), the EVM engine calculates the intrinsic gas as 25,200. Because 25,200 exceeds the 21,000 gas limit, the engine throws an `InvalidTransaction::CallGasCostMoreThanGasLimit` error. The Block Executor directly maps this into a fatal `BlockExecutionError::evm` and halts block construction completely. This results in an unrecoverable chain halt for any validator attempting to propose a block.
 
 ## Vulnerability Detail
-1. ### The Architectural Gap: ADR 0004 vs. Modulo 64
-According to **Arc ADR 0004 ("Base Fee Validation")**, the network ensures block validity by asserting that the proposer's `nextBaseFee` in the block header matches the value deterministically stored in the `SystemAccounting` state.
+1. ### Mempool Accepts the Transaction
+The `ArcTransactionValidator` in `execution-txpool` delegates gas limit validation to the standard `EthTransactionValidatorBuilder` (line 617, `validator.rs`). The standard ETH validator requires only 21,000 intrinsic gas for a standard `CALL` transaction with value. The mempool successfully queues the transaction.
 
-However, the implementation of `compute_gas_values_storage_slot` utilizes a **Modulo 64** ring-buffer strategy for persistent trie storage. This creates a fundamental conflict:
-- **ADR 0004** requires the state to be a source of truth for base fee validation.
-- **The Modulo Implementation** causes that source of truth to be physically overwritten every 64 blocks.
-
-**Source**: `crates/precompiles/src/system_accounting.rs:86-102`
+2. ### The Execution Engine Rejects the Transaction
+During execution, `ArcEvmHandler::validate_initial_tx_gas` evaluates the same transaction:
 ```rust
-pub fn compute_gas_values_storage_slot(block_number: u64) -> StorageKey {
-    // Map block number into ring buffer
-    let key_value = block_number % GAS_VALUES_RING_BUFFER_SIZE; // <--- VULNERABILITY
-    // ...
+// crates/evm/src/handler.rs:119
+if self.hardfork_flags.is_active(ArcHardfork::Zero6) {
+    let mut extra_gas = PRECOMPILE_SLOAD_GAS_COST;
+    if !tx.value().is_zero() {
+        extra_gas += PRECOMPILE_SLOAD_GAS_COST; // +4,200 gas total
+    }
+    init_and_floor_gas.initial_gas = init_and_floor_gas.initial_gas.checked_add(extra_gas).ok_or(...)?;
+    if init_and_floor_gas.initial_gas > tx.gas_limit() {
+        // Fails here because 25,200 > 21,000
+        return Err(InvalidTransaction::CallGasCostMoreThanGasLimit { ... }.into());
+    }
 }
 ```
 
-2. ### Sync Non-Determinism & State Corruption
-In a BFT network with "Instant Deterministic Finality," the integrity of the state trie is paramount. The current design introduces **State Non-Determinism** during node catch-up:
-1.  **Linear Sync**: A node syncing from Block 0 will write `GasValues` to Slot `X` at Block 1, then overwrite it at Block 65, then again at Block 129.
-2.  **Historical Integrity Failure**: If a validator or archive node is queried for the state of Block 1, the trie will return data for Block 193 (or whichever block most recently aliased to that slot).
-3.  **Merkle Proof Failure**: Any external systems (bridges, L2s) relying on Merkle Proofs of historical gas statistics will find the proofs invalid because the trie nodes have been modified by a future, unrelated block.
-4. **Sync Deadlock**: Because `retrieve_gas_values(parent_block)` is used by the execution logic to validate `nextBaseFee`, an archiving node syncing past a reorg or starting fresh will retrieve the overwritten future aliased state instead of the historical one. This leads to an immediate mismatch with `extra_data`, causing a network-wide consensus deadlock.
+3. ### The Network Halts
+In `ArcBlockExecutor::execute_transaction_without_commit`, the returned error is mapped to a fatal `BlockExecutionError::evm` rather than being gracefully skipped or marked as a failed transaction.
+
+```rust
+// crates/evm/src/executor.rs:445
+let result = self.evm.transact(tx_env)
+    .map_err(|err| BlockExecutionError::evm(err, tx.tx().trie_hash()))?; // <--- HALTS BLOCK BUILDER
+```
+This forces the block builder to panic/revert entirely.
 
 ## Proof of Concept
-- **Block 1**: `SystemAccounting` writes `GasValues_1` to `Slot_A` (since 1 % 64 = 1).
-- **Block 65**: `SystemAccounting` writes `GasValues_65` to `Slot_A` (since 65 % 64 = 1). This blindly overwrites `GasValues_1`.
-- **Consensus Failure**: A node verifying Block 1 during a state catch-up will compute its `state_root`. Because `Slot_A` now contains the values for Block 65, the computed state root will wildly mismatch the historical block header, and the node will completely halt syncing.
+1. The attacker creates 10,000 standard `CALL` transactions sending 1 wei to themselves or another EOA.
+2. The attacker sets the `gasLimit` on all transactions exactly to `21,000`.
+3. The attacker submits the transactions to the Arc Network RPC.
+4. The RPC nodes (using `ArcTransactionValidator`) accept the transactions into the mempool because `21000 >= 21000` (standard intrinsic gas).
+5. The Proposer attempts to construct the next block and pulls these transactions from the mempool.
+6. The `executor.rs` attempts to `transact()` the first transaction. The EVM handler throws `CallGasCostMoreThanGasLimit`.
+7. The `execute_transaction_without_commit` function returns `Err(BlockExecutionError::evm(...))`.
+8. The block building process crashes. The Proposer misses their slot.
+9. The next Proposer attempts the exact same process with the same mempool state, and also crashes. The network halts completely.
 
 ## CVSS 4.0 Assessment
-**Severity**: 10.0 (Critical)
-**Vector**: `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H`
+**Severity**: 9.3 (Critical)
+**Vector**: `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:H/SI:H/SA:H`
 
 ### **Metric Justification**
-- **Attack Vector: Network (AV:N)**: State corruption is triggered automatically by regular network progression.
-- **Attack Complexity: Low (AC:L)**: The vulnerability is an inherent logic flaw requiring no specialized effort.
-- **Attack Requirements: None (AT:N)**: No conditional requirements are needed.
-- **Privileges Required: None (PR:N)**: Unprivileged block progression naturally causes the aliasing.
-- **User Interaction: None (UI:N)**: Fully automated state corruption.
-- **Vulnerable System Impact (VC:H, VI:H, VA:H)**:
-    - **Integrity (VI:H)**: Total. The integrity of the global state trie is permanently compromised.
-    - **Availability (VA:H)**: Total. Discrepancies in the state trie root will cause validators to fail consensus and cease block production.
-    - **Confidentiality (VC:H)**: High. Historical values are overwritten and permanently lost.
-- **Subsequent System Impact (SC:H, SI:H, SA:H)**: Bridges and L2s relying on Arc state roots for settlement will encounter invalid proofs. The entire Arc ecosystem goes offline when the consensus layer halts.
-
-### **CWE Classifications**
-- **CWE-682**: Incorrect Calculation
-- **CWE-664**: Improper Control of a Resource Through its Lifetime
+- **Attack Vector: Network (AV:N)**: Triggered remotely by submitting standard transactions via RPC.
+- **Attack Complexity: Low (AC:L)**: The exploit requires no custom opcodes, smart contracts, or specialized logic. It's just a standard transaction with a 21,000 gas limit.
+- **Privileges Required: None (PR:N)**: Any unprivileged user can flood the mempool.
+- **Availability Impact (VA:H)**: The entire network halts because the block builder crashes on processing.
+- **Subsequent Impact (SC:H, SI:H, SA:H)**: Complete Denial of Service for the Arc Network and all relying applications.
 
 ## Recommendation
-The storage slot for gas statistics **must be unique** for every block height. Remove the modulo operation from the storage slot calculation.
+To prevent this asymmetry, the custom `ArcTransactionValidator` MUST implement the same Zero6 intrinsic gas calculation override as the `ArcEvmHandler`.
 
-```rust
-// crates/precompiles/src/system_accounting.rs
-pub fn compute_gas_values_storage_slot(block_number: u64) -> StorageKey {
-    // Use the absolute block number directly to prevent aliasing
-    let key_value = block_number;
+Modify `ArcTransactionValidator` (or the underlying standard `EthTransactionValidator`) to accurately calculate intrinsic gas including the `ArcHardfork::Zero6` blocklist `SLOAD` penalties, and reject transactions with insufficient gas limits at the mempool layer.
 
-    // Left-pad 8 byte u64 to 32 bytes
-    let mut key_bytes = [0u8; 32];
-    key_bytes[24..].copy_from_slice(key_value.to_be_bytes().as_ref());
-
-    // ...
-}
-```
-
-## Impact
-- **Historical State Loss**: Permanent corruption of historical gas and fee statistics in the global state trie.
-- **Consensus Divergence / Sync Deadlocks**: Nodes entering the network via different sync strategies (Snap Sync vs. Full Sync) arrive at different trie configurations. An archiving or fresh node will fail to process historical blocks because their required gas values have been overwritten by future states.
-- **Oracle / Bridge Failure**: Any external protocol validating cross-chain messages via Arc Merkle proofs will instantly break when the storage slots undergo aliased modifications.
+Alternatively, if a transaction fails the EVM validation strictly due to `CallGasCostMoreThanGasLimit` during `execute_transaction_without_commit`, the executor should log a warning and skip the transaction rather than returning a fatal `BlockExecutionError::evm` that halts block assembly.
