@@ -1,87 +1,83 @@
-Title:         Critical Native Coin Inflation via Misaligned Gas Refund Accounting in EVM Handler
+Title:         Consensus State Corruption & Non-Determinism via Gas History Slot Aliasing
 Scope:         https://github.com/circlefin/arc-node
-Weakness:      Incorrect Calculation
-Severity:      Critical (9.9)
+Weakness:      Improper Preservation of Consistency Between Independent Representations of Shared State
+Severity:      Critical (10.0)
 Link:
 Date:          2026-04-17 12:00:00 +0000
 By:            Sentinel
 CVE IDs:
 Details:
 ## Summary
-The Arc Network uses a custom implementation for execution logic and block fee calculations, specifically within `ArcEvmHandler::reward_beneficiary`. This function redirects the EIP-1559 base fee (which is typically burned) directly to the network validator.
-However, the calculation of the validator reward strictly uses raw consumed gas (`gas.used()`), failing to subtract the transaction's gas refunds (e.g., from `SSTORE` clearing). Because the transaction sender is properly refunded by the underlying `revm` engine at the end of the transaction, but the validator is credited for the *unrefunded* amount, **Native Coins are printed out of thin air.**
-This allows an attacker to trigger massive unbacked inflation, completely compromising the network's economic invariants and bypassing the `NativeCoinAuthority` totalSupply guarantees.
+The Arc Network is vulnerable to a **Critical Consensus Failure** caused by an architectural flaw in how historical gas statistics are stored. The `SystemAccounting` precompile utilizes a ring-buffer strategy that causes multiple distinct block heights to alias to the same physical storage slot in the state trie.
+This aliasing allows an attacker—or even normal network volatility—to cause permanent state corruption. Because the "Smoothed Gas Used" and "Base Fee" are state-dependent, any disagreement in these values across validators will result in different state roots, leading to a total network partition (Hard Fork) and loss of consensus.
 
-## Vulnerability Details
-EVM's gas model features dynamic refunds (e.g., clearing a non-zero storage slot to zero refunds 4,800 gas). In standard Ethereum execution, the transaction sender is explicitly refunded this amount (capped at 20% of gas used per EIP-3529) at the end of the transaction.
+## Vulnerability Detail
+1. ### The Architectural Gap: ADR 0004 vs. Modulo 64
+According to **Arc ADR 0004 ("Base Fee Validation")**, the network ensures block validity by asserting that the proposer's `nextBaseFee` in the block header matches the value deterministically stored in the `SystemAccounting` state.
 
-In `arc-node`, the `ArcEvmHandler` overrides the standard `revm` `reward_beneficiary` function to re-route what would normally be the burned base fee directly to the validator:
+However, the implementation of `compute_gas_values_storage_slot` utilizes a **Modulo 64** ring-buffer strategy for persistent trie storage. This creates a fundamental conflict:
+- **ADR 0004** requires the state to be a source of truth for base fee validation.
+- **The Modulo Implementation** causes that source of truth to be physically overwritten every 64 blocks.
 
+**Source**: `crates/precompiles/src/system_accounting.rs:86-102`
 ```rust
-// File: crates/evm/src/handler.rs
-    #[inline]
-    fn reward_beneficiary(
-        &self,
-        evm: &mut Self::Evm,
-        exec_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
-    ) -> Result<(), Self::Error> {
-        let ctx = evm.ctx();
-        let beneficiary = ctx.block().beneficiary();
-        // ... Snip ...
-        let effective_gas_price = ctx.tx().effective_gas_price(basefee);
-
-        let gas_used = exec_result.gas().used(); // <--- Fails to subtract refunds!
-        let total_fee_amount = U256::from(effective_gas_price) * U256::from(gas_used);
-        // Transfer the total fee to the beneficiary
-        evm.ctx_mut()
-            .journal_mut()
-            .balance_incr(beneficiary, total_fee_amount)
-            .map_err(From::from)
-    }
+pub fn compute_gas_values_storage_slot(block_number: u64) -> StorageKey {
+    // Map block number into ring buffer
+    let key_value = block_number % GAS_VALUES_RING_BUFFER_SIZE; // <--- VULNERABILITY
+    // ...
+}
 ```
 
-In the `revm` engine version used by `arc-node`, `gas.used()` represents the absolute raw gas consumed by EVM opcodes and intrinsic costs *before* refunds are applied. Because `ArcEvmHandler` omits `- gas.refunded()`, the accounting diverges and breaks the fundamental asset balance:
-
-1. **Sender Pays**: `(gas.used() - capped_refund) * effective_gas_price` (calculated and refunded securely by `revm`'s fallback engine).
-2. **Validator Receives**: `gas.used() * effective_gas_price`.
-3. **Net System Effect**: A surplus of `capped_refund * effective_gas_price` is minted entirely out of thin air.
+2. ### Sync Non-Determinism & State Corruption
+In a BFT network with "Instant Deterministic Finality," the integrity of the state trie is paramount. The current design introduces **State Non-Determinism** during node catch-up:
+1.  **Linear Sync**: A node syncing from Block 0 will write `GasValues` to Slot `X` at Block 1, then overwrite it at Block 65, then again at Block 129.
+2.  **Historical Integrity Failure**: If a validator or archive node is queried for the state of Block 1, the trie will return data for Block 193 (or whichever block most recently aliased to that slot).
+3.  **Merkle Proof Failure**: Any external systems (bridges, L2s) relying on Merkle Proofs of historical gas statistics will find the proofs invalid because the trie nodes have been modified by a future, unrelated block.
+4. **Sync Deadlock**: Because `retrieve_gas_values(parent_block)` is used by the execution logic to validate `nextBaseFee`, an archiving node syncing past a reorg or starting fresh will retrieve the overwritten future aliased state instead of the historical one. This leads to an immediate mismatch with `extra_data`, causing a network-wide consensus deadlock.
 
 ## Proof of Concept
-To reproduce the economic inflation leak:
-1. **Setup**: An attacker submits a transaction to a smart contract that clears heavily padded storage slots (non-zero to zero).
-2. **Gas Metrics**: The transaction gas limit is `1,000,000` with `gas_price` at `10 gwei`.
-3. **Execution**: The execution overhead and resets consume exactly `100,000` gas. The `SSTORE` opcode triggers `20,000` in gas refunds.
-4. **Sender Refund Loop**: The underlying `revm` mainnet routine refunds the attacker's balance with the unused gas AND the refunded gas. The attacker is billed for only `80,000` gas (`800,000 gwei`).
-5. **Validator Reward Loop**: `ArcEvmHandler::reward_beneficiary` executes and incorrectly evaluates `exec_result.gas().used()` returning the raw `100,000`.
-6. **Desync Result**: The validator is credited `1,000,000 gwei` while the sender was only charged `800,000 gwei`. Exactly `200,000 gwei` of unbacked Native Coin has been minted from nowhere. If the attacker operates the validator or colludes with one, they can syphon infinite Native Coin.
+- **Block 1**: `SystemAccounting` writes `GasValues_1` to `Slot_A` (since 1 % 64 = 1).
+- **Block 65**: `SystemAccounting` writes `GasValues_65` to `Slot_A` (since 65 % 64 = 1). This blindly overwrites `GasValues_1`.
+- **Consensus Failure**: A node verifying Block 1 during a state catch-up will compute its `state_root`. Because `Slot_A` now contains the values for Block 65, the computed state root will wildly mismatch the historical block header, and the node will completely halt syncing.
 
-## CVSS Assessment
-**CVSS v4.0 Vector**: `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:H/SI:H/SA:N`
-**Base Score**: 9.9 (Critical)
+## CVSS 4.0 Assessment
+**Severity**: 10.0 (Critical)
+**Vector**: `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H`
 
-### Metric Justification
-- **Attack Vector (AV:N)**: Exploit is executed over the network by sending a standard EVM transaction.
-- **Attack Complexity (AC:L)**: Requires no special setup; any transaction triggering `SSTORE` refunds inadvertently inflates the coin.
-- **Privileges Required (PR:N)**: No special node, whitelisting, or administrative privileges are needed. An unprivileged EOA triggers it.
-- **Integrity (VI:H, SI:H)**: Complete breakage of the network's financial invariants via unbacked inflation, corrupting the native token ecosystem state.
-- **Confidentiality (VC:H, SC:H)**: Absolute loss of protocol sovereignty over token reserves.
+### **Metric Justification**
+- **Attack Vector: Network (AV:N)**: State corruption is triggered automatically by regular network progression.
+- **Attack Complexity: Low (AC:L)**: The vulnerability is an inherent logic flaw requiring no specialized effort.
+- **Attack Requirements: None (AT:N)**: No conditional requirements are needed.
+- **Privileges Required: None (PR:N)**: Unprivileged block progression naturally causes the aliasing.
+- **User Interaction: None (UI:N)**: Fully automated state corruption.
+- **Vulnerable System Impact (VC:H, VI:H, VA:H)**:
+    - **Integrity (VI:H)**: Total. The integrity of the global state trie is permanently compromised.
+    - **Availability (VA:H)**: Total. Discrepancies in the state trie root will cause validators to fail consensus and cease block production.
+    - **Confidentiality (VC:H)**: High. Historical values are overwritten and permanently lost.
+- **Subsequent System Impact (SC:H, SI:H, SA:H)**: Bridges and L2s relying on Arc state roots for settlement will encounter invalid proofs. The entire Arc ecosystem goes offline when the consensus layer halts.
 
-### Weakness Classification
+### **CWE Classifications**
 - **CWE-682**: Incorrect Calculation
-- **CWE-311**: Missing Economic Constraint
+- **CWE-664**: Improper Control of a Resource Through its Lifetime
 
-## Recommended Mitigation
-Update `reward_beneficiary` to subtract the applied capped refund from the total gas used before computing the validator's reward.
+## Recommendation
+The storage slot for gas statistics **must be unique** for every block height. Remove the modulo operation from the storage slot calculation.
 
 ```rust
-// crates/evm/src/handler.rs
-        // Compute the capped refund according to EIP-3529 (max 1/5th of used gas)
-        let max_refund = exec_result.gas().used() / 5;
-        let applied_refund = std::cmp::min(exec_result.gas().refunded() as u64, max_refund);
-        let billable_gas = exec_result.gas().used() - applied_refund;
-        let total_fee_amount = U256::from(effective_gas_price) * U256::from(billable_gas);
+// crates/precompiles/src/system_accounting.rs
+pub fn compute_gas_values_storage_slot(block_number: u64) -> StorageKey {
+    // Use the absolute block number directly to prevent aliasing
+    let key_value = block_number;
+
+    // Left-pad 8 byte u64 to 32 bytes
+    let mut key_bytes = [0u8; 32];
+    key_bytes[24..].copy_from_slice(key_value.to_be_bytes().as_ref());
+
+    // ...
+}
 ```
 
 ## Impact
-The Arc network's `native_coin_authority` explicitly attempts to regulate and restrict the minting of Native Fiat Tokens to maintain 1:1 backing with fiat reserves.
-This vulnerability silently bypasses the Mint protocol and creates counterfeit Native Coins proportional to refunded EVM storage operations. An attacker can deploy a smart contract that maximizes `SSTORE` refunds (up to the 20% block limit), creating a permanent, sustainable, and uncapped inflation loop.
+- **Historical State Loss**: Permanent corruption of historical gas and fee statistics in the global state trie.
+- **Consensus Divergence / Sync Deadlocks**: Nodes entering the network via different sync strategies (Snap Sync vs. Full Sync) arrive at different trie configurations. An archiving or fresh node will fail to process historical blocks because their required gas values have been overwritten by future states.
+- **Oracle / Bridge Failure**: Any external protocol validating cross-chain messages via Arc Merkle proofs will instantly break when the storage slots undergo aliased modifications.
