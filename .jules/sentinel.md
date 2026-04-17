@@ -1,4 +1,4 @@
-## 2025-04-17 - 🛡️ Sentinel: Arithmetic Panic in Arc Base Fee Processing
-**Vulnerability:** A zero-denominator evaluation in `arc_calc_next_block_base_fee` allows a division by zero panic, completely halting all nodes processing the block state.
-**Learning:** Rust's integer division truncates. Intermediate division in a denominator block `(gas_target * SCALE / k_rate)` can easily floor to zero when constants or protocol configurations are scaled. This kind of calculation requires rearranging the arithmetic order to preserve precision and prevent division by zero.
-**Prevention:** Avoid performing division operations in denominators. Reorder arithmetic so multiplication happens first in a large numerator, followed by a single division with a safely bounded denominator.
+## 2026-04-16 - 🛡️ Sentinel: Compliant Burn Blocked for Zero-Nonce Sanctioned Wallets
+**Vulnerability:** A logic check in `check_can_decr_account` designed to prevent standard users from clearing empty accounts (`nonce == 0`) inadvertently applies to the privileged `NativeCoinAuthority`, preventing it from executing a regulatory `burn` on sanctioned funds stored in fresh wallets.
+**Learning:** Re-using standard EVM validation logic (like state clearing prevention) for highly privileged precompiles (like Authority controls) creates edge cases where the privileged entity is restricted by user-level invariants.
+**Prevention:** Privileged operations must bypass user-level state clearing protections, passing a context flag like `is_authority` to skip EVM semantic guards.
