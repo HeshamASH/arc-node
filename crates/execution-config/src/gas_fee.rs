@@ -330,6 +330,19 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "attempt to divide by zero")]
+    fn test_division_by_zero_panic_poc() {
+        // PoC for Division by Zero in arc_calc_next_block_base_fee
+        let gas_limit = 100;
+        let iem = 100;
+        let k_rate = 10001;
+        let base_fee = 100;
+        let gas_used = 2;
+
+        arc_calc_next_block_base_fee(gas_used, gas_limit, base_fee, k_rate, iem);
+    }
+
+    #[test]
     fn base_fee_should_greater_than_zero() {
         // For eip1559, the base fee could be zero if max_change_denominator is 1.
         for (
