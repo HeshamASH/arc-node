@@ -1,0 +1,4 @@
+## 2026-04-17 - Critical Native Coin Inflation via Misaligned Gas Refund Accounting
+**Vulnerability:** The `ArcEvmHandler::reward_beneficiary` function calculates the validator's reward using `exec_result.gas().used()` without subtracting gas refunds (e.g., from clearing storage slots with `SSTORE`). Because `revm` naturally refunds the transaction sender for these operations, the unrefunded gas cost is printed as new native coin, causing uncapped inflation and breaking 1:1 fiat backing.
+**Learning:** Overriding EVM's core economic mechanisms (like EIP-1559 base fee burning or validator rewards) requires rigorous replication of underlying `revm` gas semantics, particularly regarding dynamic refunds and EIP-3529 refund caps.
+**Prevention:** Always deduct the EIP-3529 capped `gas.refunded()` from `gas.used()` when calculating billable gas for validator fee rewards to ensure symmetric sender-billing and validator-rewarding.
