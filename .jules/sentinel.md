@@ -1,0 +1,5 @@
+## 2026-04-16 - [CRITICAL] Validator Fee Accounting Gas Refund Inflation
+
+**Vulnerability:** The EVM handler incorrectly calculates the validator fee by failing to subtract the dynamically applied gas refunds from `gas.used()`.
+**Learning:** This architectural flaw allowed a transaction sender to be refunded for `SSTORE` state clears via standard `revm` capabilities while simultaneously crediting the validator for the entire unrefunded amount. Since this bypasses the strict `mint()` accounting path, the `NativeCoinAuthority` `total_supply` is systemically dishonest, tricking algorithmic stablecoins and bridges out of the actual token in circulation. EIP-3529 logic must be correctly carried through custom Execution layers that manually reroute EVM `base_fee` distributions to prevent native coin minting and total supply divergence.
+**Prevention:** Subtract `gas.refunded()` out of the total `gas.used()`. Cap the `max_refund` to 1/5th (gas_used / 5) properly before assigning the `billable_gas` logic to a `total_fee_amount` transaction. Ensure full test coverage over these edge scenarios.
