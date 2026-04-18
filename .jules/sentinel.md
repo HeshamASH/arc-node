@@ -1,0 +1,4 @@
+## 2025-04-17 - [CRITICAL] Total State Root Divergence (Consensus Fork) via OnStateHook Side-Effect Leakage in Block Execution Validations
+**Vulnerability:** The EVM Executor in `ArcBlockExecutor` incorrectly executes system calls and transactions that stream state changes to the consensus layer's `OnStateHook` *before* completing all header validations (`apply_pre_execution_changes` and `finish`).
+**Learning:** State leaks to the consensus layer are unrecoverable. Validating nodes that drop an invalid block halfway through execution retain the corrupted state root emitted by the hook, causing permanent non-determinism (a chain fork) against nodes that didn't process the block.
+**Prevention:** All block-level validations (e.g. beneficiary checks, gas limits, extra_data parameters) must rigidly execute before the first state-modifying instruction, or the consensus interface must support explicit block-level rollback/atomic hook commits.

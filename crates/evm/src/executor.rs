@@ -1108,6 +1108,69 @@ mod tests {
         );
     }
 
+    use std::sync::{Arc, Mutex};
+    use alloy_evm::block::{StateChangeSource, StateChangePreBlockSource};
+
+    struct MockHook {
+        called: Arc<Mutex<bool>>,
+    }
+
+    impl OnStateHook for MockHook {
+        fn on_state(&mut self, source: StateChangeSource, _state: &revm::state::EvmState) {
+            if let StateChangeSource::PreBlock(StateChangePreBlockSource::BlockHashesContract) = source {
+                *self.called.lock().unwrap() = true;
+            }
+        }
+    }
+
+    #[test]
+    fn test_state_root_divergence_poc() {
+        let chain_spec = LOCAL_DEV.clone();
+
+        let mut db = InMemoryDB::default();
+        insert_alloc_into_db(&mut db, chain_spec.genesis());
+
+        let evm_config = create_evm_config(chain_spec.clone());
+
+        // Use a wrong beneficiary address to trigger a validation failure
+        let wrong_beneficiary = address!("0000000000000000000000000000000000000bad");
+
+        let mut block_env = get_mock_block_env();
+        block_env.number = U256::from(10); // Zero5 is active
+        block_env.beneficiary = wrong_beneficiary;
+
+        let cfg_env = CfgEnv::new()
+            .with_chain_id(chain_spec.chain_id())
+            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
+        let evm_env = EvmEnv { cfg_env, block_env };
+
+        let mut state = State::builder().with_database(db).build();
+        let evm = evm_config.evm_with_env(&mut state, evm_env);
+
+        let ctx = get_mock_execution_ctx();
+
+        let mut executor = ArcBlockExecutor::new(
+            evm,
+            ctx,
+            chain_spec.as_ref(),
+            evm_config.inner.executor_factory.receipt_builder(),
+        );
+
+        let hook_called = Arc::new(Mutex::new(false));
+        let mock_hook = MockHook { called: Arc::clone(&hook_called) };
+        executor.set_state_hook(Some(Box::new(mock_hook)));
+
+        // This fails validation and aborts block execution
+        let result = executor.apply_pre_execution_changes();
+        assert!(result.is_err(), "Beneficiary validation should fail");
+
+        let was_called = *hook_called.lock().unwrap();
+        assert!(
+            was_called,
+            "CRITICAL VULNERABILITY: OnStateHook was called and emitted state mutations to the consensus engine BEFORE the block validation failed and aborted. This causes permanent state root divergence between nodes!"
+        );
+    }
+
     #[test]
     fn test_beneficiary_validation_fails_when_mismatched() {
         // Test that beneficiary validation fails when header beneficiary doesn't match ProtocolConfig
