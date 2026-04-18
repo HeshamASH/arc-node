@@ -1,4 +1,4 @@
-## 2026-04-16 - 🛡️ Sentinel: Compliant Burn Blocked for Zero-Nonce Sanctioned Wallets
-**Vulnerability:** A logic check in `check_can_decr_account` designed to prevent standard users from clearing empty accounts (`nonce == 0`) inadvertently applies to the privileged `NativeCoinAuthority`, preventing it from executing a regulatory `burn` on sanctioned funds stored in fresh wallets.
-**Learning:** Re-using standard EVM validation logic (like state clearing prevention) for highly privileged precompiles (like Authority controls) creates edge cases where the privileged entity is restricted by user-level invariants.
-**Prevention:** Privileged operations must bypass user-level state clearing protections, passing a context flag like `is_authority` to skip EVM semantic guards.
+## 2026-04-17 - 🛡️ Sentinel: Partial State Commit at BFT / EVM Sync Boundary
+**Vulnerability:** A severe architectural failure exists between the Consensus Layer and Execution Layer where `decided_blocks` certificates are permanently written to the CL Database before the EVM `finalize_decided_block()` API returns a success payload. If the EVM fails, the node restarts the BFT height but cannot recover due to occupied database state.
+**Learning:** State writes spanning distributed system boundaries (like an Execution client and a Consensus client) must act as atomic transactions. Committing one side of the transaction before confirming the other creates unrecoverable partial state invariants that can be maliciously triggered by bad actors.
+**Prevention:** In distributed architecture, always execute untrusted downstream external transitions (EVM state execution) before finalizing local consensus persistence (CL database writes).

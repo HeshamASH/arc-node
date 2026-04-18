@@ -1,73 +1,85 @@
-🛡️ Sentinel: [CRITICAL] Compliant Burn Blocked for Zero-Nonce Sanctioned Wallets
+🛡️ Sentinel: [CRITICAL] Partial State Commit / BFT Amnesia via EVM Finalization Failure
 
 ## CVSS 4.0 Assessment
-**Severity**: 9.2 (Critical)
-**Vector**: `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:H/VA:N/SC:H/SI:N/SA:N`
+**Severity**: 10.0 (Critical)
+**Vector**: `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:H/VA:H/SC:H/SI:H/SA:H`
 
 ### **Metric Justification**
-- **Attack Vector (AV:N)**: An attacker exploits this remotely by simply interacting with addresses on the network.
-- **Attack Complexity (AC:L)**: The exploit happens passively; the sanctioned entity merely has to keep their funds in a fresh wallet.
-- **Privileges Required (PR:N)**: The mechanism blocking the burn is triggered strictly by the natural state (`nonce=0`) of an unprivileged user's wallet.
-- **Integrity (VI:H)**: Complete bypass of Circle `burn` capabilities.
-- **Subsequent System (SC:H)**: Regulatory non-compliance impacts the overarching Fiat management logic. Failure to execute a mandatory burn directly violates external legal and compliance guarantees.
+- **Attack Vector (AV:N)**: A malicious node acting as proposer can broadcast a block payload over the P2P network.
+- **Attack Complexity (AC:L)**: A malicious proposer simply builds a block that correctly validates BFT signatures but intentionally fails within the EVM boundary.
+- **Attack Requirements (AT:N)**: No special node state or specific configurations are needed.
+- **Privileges Required (PR:N)**: A proposer slot is required, but proposing is part of normal unprivileged consensus participation.
+- **User Interaction (UI:N)**: Network propagation handles the attack entirely.
+- **Integrity (VI:H)**: High. The local CL store becomes desynchronized and permanently invalid, containing a partially-committed certificate for a height that failed to execute.
+- **Availability (VA:H)**: High. The node crashes or infinite-loops when attempting to restart the height.
+- **Subsequent System Impact (SC:H, SI:H, SA:H)**: Complete network halt. Every honest node on the network processing the decided block will encounter the EVM error, attempt a restart, hit the DB conflict, and permanently halt.
 
 ### **CWE Classifications**
-- **CWE-682**: Incorrect Calculation
-- **CWE-840**: Business Logic Error
+- **CWE-696**: Incorrect Behavior Order (Partial State Commit)
+- **CWE-566**: Authorization Bypass Through User-Controlled SQL Primary Key (or similar Storage Collision logic)
+- **CWE-400**: Uncontrolled Resource Consumption (Infinite Crash Loop)
 
 ## Summary
-The Circle Arc Network utilizes a custom `check_can_decr_account` helper within its `NativeCoinAuthority` framework to safely ensure account decrements do not orphan or maliciously empty storage slots. This decrement logic is used centrally by the `burn` function to seize assets from sanctioned addresses.
+The Arc Network uses an execution layer (EVM Engine) coupled with a consensus layer (BFT). When the network decides on a block (reaches 2/3 commit signatures), the consensus node calls `decide()` which internally calls `commit()` to finalize the state.
 
-However, a critical logic constraint explicitly reverts the execution if a native coin decrement function clears the remaining balance of an account which happens to be empty (having `nonce == 0` and uninitialized code hash).
+A critical Partial State Commit vulnerability exists in `crates/malachite-app/src/handlers/decided.rs`. The `commit()` function sequentially performs three steps:
+1. It permanently inserts the `CommitCertificate` into the `decided_blocks` store.
+2. It eagerly cleans up "stale consensus data" (which includes the undecided block it was tracking).
+3. It passes the payload to `block_finalizer.finalize_decided_block()` to execute the block on the EVM engine.
 
-If a malicious entity or a heavily sanctioned decentralized application directs illicit incoming transfers to newly generated "Zero-Nonce" wallet addresses in order to hold funds, the Circle Native Coin Authority loses the ability to execute its compliant `burn` routine across these wallets entirely. The burn reverts, leaving the sanctioned funds completely irrecoverable by the compliance team but perfectly intact for the underlying wallet.
+If `finalize_decided_block()` fails (which a malicious proposer can intentionally trigger by crafting a block with valid consensus signatures but an invalid EVM transition), the `commit()` function bubbles the error up, resulting in a `Decision::Failure`. The `finalized` handler will then call `restart_height()` to try again.
+
+However, because the `commit()` function already permanently persisted the certificate to the CL database (and wiped its tracked undecided blocks), the node is placed in a **permanently bricked** state. Upon restarting the height, the database slots for that height are occupied, leading to a permanent sync divergence or infinite crash loop.
 
 ## Vulnerability Details
-When `NativeCoinAuthority::burnCall` triggers the underlying `balance_decr()`, the balance state is evaluated using `arc-node/crates/precompiles/src/helpers.rs::check_can_decr_account`:
+The vulnerability relies on the lack of a transactional rollback when crossing the BFT / EVM boundary.
 
-**Source**: `crates/precompiles/src/helpers.rs`
-
+**Source**: `crates/malachite-app/src/handlers/decided.rs:commit()`
 ```rust
-pub(crate) fn check_can_decr_account(...) -> Result<(), PrecompileErrorOrRevert> {
-    // Check that the account has sufficient balance
-    let from_account_balance = loaded_account_info.balance.checked_sub(amount)...;
-    // Check that the account would not be emptied if this transfer goes through
-    let from_account_is_empty = from_account_balance.is_zero()
-        && loaded_account_info.nonce == 0
-        && (loaded_account_info.code_hash() == KECCAK_EMPTY
-            || loaded_account_info.code_hash().is_zero());
-    // VULNERABILITY: This condition fails to distinguish between a regular user
-    // and the privileged NativeCoinAuthority.
-    if from_account_is_empty {
-        return Err(PrecompileErrorOrRevert::new_reverted(
-            *gas_counter,
-            ERR_CLEAR_EMPTY, // "Cannot clear empty account"
-        ));
-    }
-    // ...
-}
+    decided_blocks
+        .store(certificate, block.execution_payload.clone(), block.proposer)
+        .await
+        // ... (1) Certificate stored successfully
+
+    // Clean up stale consensus data
+    if let Err(e) = pruning_service
+        .clean_stale_consensus_data(certificate_height)
+        // ... (2) Undecided block metadata wiped
+
+    // Finalize the decided payload
+    let (new_latest_block, _latest_valid_hash) =
+        block_finalizer.finalize_decided_block(certificate_height, &block.execution_payload)
+        .await
+        // ... (3) EVM FAILS! Return Err() -> Decision::Failure
 ```
 
-While this check is historically used to prevent clearing uninitialized accounts, its application to the **Authority's burn function** is a critical failure. If a sanctioned entity has received funds but has not yet sent a transaction (maintaining a nonce of 0), the Authority is technically prohibited from burning those funds to comply with law enforcement orders.
+When the state drops back to `crates/malachite-app/src/handlers/finalized.rs`, it executes:
+```rust
+    let next = match decision {
+        Decision::Success(next_height_info) => start_next_height(state, *next_height_info).await?,
+        Decision::Failure(report) => {
+            error!(error = ?report, "🔴 Decision failure, restarting height");
+            restart_height(state, height).await?
+        }
+    };
+```
+
+This restart is fatal because the `decided_blocks` mapping for `height` is already populated. A single malicious proposer can "Brick" the entire network by broadcasting a block that passes BFT validation (so 2/3 honest nodes sign it and decide it) but intentionally fails EVM execution finality. Every single honest node will witness the block, store the certificate, fail execution, restart the height, and permanently halt due to the partial state commit.
 
 ## Proof of Concept
-An executable test `test_check_can_decr_account_poc_sanction_burn_blocked` was added to `crates/precompiles/src/helpers.rs` that programmatically verifies the `NativeCoinAuthority` would be rejected with `ERR_CLEAR_EMPTY` when attempting to burn the entire balance of an account with `nonce = 0`.
+A failing unit test `test_decide_partial_commit_restart_panic` was successfully added to `crates/malachite-app/src/handlers/decided.rs` to explicitly trigger and demonstrate this vulnerability without applying a fix.
 
-## Recommended Remediation
-Implement an explicit bypass within `balance_decr` and `check_can_decr_account` exclusively for `burn` actions orchestrated by the `NativeCoinAuthority`. If the operation is an authority `burn`, safely execute the trie clearing or tolerate the empty account deletion without triggering `ERR_CLEAR_EMPTY`.
+## Recommended Mitigation
+Implement a full rollback mechanism or reorder the operations so that `finalize_decided_block()` is completely successful before writing the state to `decided_blocks` or cleaning up undecided consensus data.
 
 ```rust
-// Proposed Fix in helpers.rs
-fn check_can_decr_account(account: &AccountInfo, amount: U256, is_authority_burn: bool) -> Result<(), ...> {
-    // ...
-    if new_balance.is_zero() && account.nonce == 0 && !is_authority_burn {
-        return Err(...);
-    }
-    // ...
-}
+    // Proposed Fix: Execute EVM first
+    let (new_latest_block, _latest_valid_hash) =
+        block_finalizer.finalize_decided_block(certificate_height, &block.execution_payload).await?;
+
+    // Only store to DB if execution succeeds
+    decided_blocks.store(certificate, block.execution_payload.clone(), block.proposer).await?;
 ```
 
 ## Impact
-- **Regulatory Non-Compliance**: Circle becomes technically and mathematically incapable of fulfilling "Seize and Burn" orders for sanctioned assets held in newly created wallets.
-- **Protocol Limitation**: The `NativeCoinAuthority` loses its "God Mode" regulatory guarantee over the native coin supply.
-- **Attacker Advantage**: A malicious actor aware of this flaw can "park" sanctioned funds in multiple fresh wallets, permanently immunizing them from Circle's central burn mechanic.
+A single malicious validator chosen to propose a block can permanently crash all honest validators on the network, causing a total loss of liveness and unrecoverable chain halt requiring manual database surgery on every node.
