@@ -1,0 +1,9 @@
+test: Prove AddressesDenylist bypass in EVM execution
+
+The AddressesDenylist is exclusively enforced in the mempool validator.
+The EVM layer (ArcEvm/ArcEvmHandler) is unaware of this denylist, checking
+only the NativeCoinControl blocklist.
+
+This allows any off-chain denylisted address to act as a sender
+or recipient during internal contract execution (e.g., via CallFrom).
+This PoC confirms the execution blindness.
