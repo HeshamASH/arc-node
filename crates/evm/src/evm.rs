@@ -6022,6 +6022,151 @@ mod tests {
     /// EIP-7708 Transfer log from the value transfer must appear before any logs
     /// produced by the precompile execution.
     #[test]
+    fn test_zero_value_create_bypasses_blocklist() {
+        use revm_primitives::{TxKind, Bytecode, keccak256};
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+
+        let blocklisted_factory = address!("5555555555555555555555555555555555555555");
+        let eoa = address!("1111111111111111111111111111111111111111");
+
+        let factory_runtime: alloy_primitives::Bytes = vec![
+            // push 0, push 0, push 0, create, push 0, mstore, push 32, push 0, return
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3
+        ].into();
+
+        let mut db = create_db(&[(eoa, 1_000_000), (blocklisted_factory, 1_000_000)]);
+        db.insert_account_info(
+            blocklisted_factory,
+            revm::state::AccountInfo {
+                balance: U256::from(100),
+                code_hash: keccak256(&factory_runtime),
+                code: Some(Bytecode::new_raw(factory_runtime.clone())),
+                nonce: 1,
+            },
+        );
+
+        // Add blocklisted factory manually
+        let blocklist_entry_slot = arc_precompiles::native_coin_control::blocklisted_address_slot(blocklisted_factory);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            blocklist_entry_slot,
+            U256::from(1),
+        ).unwrap();
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, 0),
+            (ArcHardfork::Zero4, 0),
+            (ArcHardfork::Zero5, 0),
+        ]);
+
+        let mut evm = Context::mainnet()
+            .with_db(db)
+            .build_mainnet_with_inspector(
+                revm_inspectors::tracing::TracingInspector::new(revm_inspectors::tracing::TracingInspectorConfig::default_geth())
+            );
+
+        let mut arc_evm = ArcEvmFactory::new(ArcHardforkFlags::with(&[ArcHardfork::Zero5]), std::sync::Arc::new(SubcallRegistry::new()))
+            .create_arc_evm(&mut evm, chain_spec.spec_id());
+
+        let tx = TxEnv {
+            caller: eoa,
+            kind: TxKind::Call(blocklisted_factory),
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            chain_id: Some(chain_spec.chain_id()),
+            ..Default::default()
+        };
+
+        // transact_one is implemented on arc_evm. Wait, `test_zero5_transfer_log_precedes_precompile_log` does it
+        // let result = arc_evm.transact_one(tx).expect("transact_one should succeed");
+        // We'll just call `test_zero_value_create_bypasses_blocklist` here.
+
+        // Wait, looking at `test_zero5_transfer_log_precedes_precompile_log` in evm.rs, it uses `create_db`, `setup_test_evm_with_db`? No, it uses:
+        // `create_db`, then `ArcEvmFactory::new`, etc. Let's copy it.
+    }
+
+    #[test]
+    fn test_zero_value_create_bypasses_blocklist() {
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+        use revm_primitives::TxKind;
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, 0),
+            (ArcHardfork::Zero4, 0),
+            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero6, 0),
+        ]);
+        let blocklisted_factory = address!("5555555555555555555555555555555555555555");
+        let eoa = address!("1111111111111111111111111111111111111111");
+
+        // Factory bytecode: PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 CREATE PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN
+        let factory_runtime: alloy_primitives::Bytes = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3
+        ].into();
+
+        let mut db = create_db(&[(eoa, 1000)]);
+        db.insert_account_info(
+            blocklisted_factory,
+            revm::state::AccountInfo {
+                balance: U256::from(0),
+                code_hash: revm_primitives::keccak256(&factory_runtime),
+                code: Some(revm_primitives::Bytecode::new_raw(factory_runtime.clone())),
+                nonce: 1,
+            },
+        );
+
+        // Blocklist the factory
+        let blocklist_entry_slot = arc_precompiles::native_coin_control::blocklisted_address_slot(blocklisted_factory);
+        db.insert_account_info(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: revm_primitives::KECCAK_EMPTY,
+                code: None,
+            },
+        );
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            blocklist_entry_slot,
+            U256::from(1),
+        ).unwrap();
+
+        let mut evm = revm::Evm::builder()
+            .with_db(db)
+            .build();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero6]);
+        let registry = std::sync::Arc::new(SubcallRegistry::new());
+        let precompiles = ArcPrecompileProvider::create_precompiles_map(chain_spec.spec_id(), flags.clone());
+        let mut factory = ArcEvmFactory::new(flags, registry, precompiles);
+        let mut evm = factory.create_arc_evm(&mut evm, chain_spec.spec_id());
+
+        let tx = TxEnv {
+            caller: eoa,
+            kind: TxKind::Call(blocklisted_factory),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            gas_price: 1,
+            chain_id: Some(chain_spec.chain_id()),
+            ..Default::default()
+        };
+
+        let result = evm.transact_one(tx).expect("nested CREATE should execute");
+        assert!(
+            result.is_success(),
+            "Outer transaction should succeed; ZERO value CREATE bypasses blocklist, got {:?}",
+            result
+        );
+
+        let state = result.state().unwrap();
+        let expected_new_contract = blocklisted_factory.create(1); // factory nonce is 1
+
+        assert!(state.get(&expected_new_contract).is_some(), "New contract should be successfully created by the blocklisted factory");
+    }
+
+    #[test]
     fn test_zero5_transfer_log_precedes_precompile_log() {
         use alloy_primitives::{Log as PrimLog, LogData};
         use reth_evm::precompiles::DynPrecompile;
@@ -6225,5 +6370,363 @@ mod tests {
             "revm version has changed from {EXPECTED_REVM_VERSION}. \
              Review all forked/mirrored revm functions listed in this test's doc comment."
         );
+        assert!(
+            workspace_toml.contains(&expected),
+            "revm version has changed from {EXPECTED_REVM_VERSION}.              Review all forked/mirrored revm functions listed in this test's doc comment."
+        );
     }
+
+    #[test]
+    fn test_zero_value_create_bypasses_blocklist() {
+        use revm_primitives::{TxKind};
+
+        let blocklisted_factory = address!("5555555555555555555555555555555555555555");
+        let eoa = address!("1111111111111111111111111111111111111111");
+
+        let factory_runtime: alloy_primitives::Bytes = vec![
+            // push 0, push 0, push 0, create, push 0, mstore, push 32, push 0, return
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3
+        ].into();
+
+        let mut evm = setup_test_evm(
+            &[(eoa, U256::from(1_000_000)), (blocklisted_factory, U256::from(1_000_000))],
+            &[(blocklisted_factory, factory_runtime.clone())],
+            &[],
+        );
+
+        // Blocklist the factory
+        let blocklist_entry_slot = arc_precompiles::native_coin_control::blocklisted_address_slot(blocklisted_factory);
+        evm.ctx_mut().journal_mut().load_account(NATIVE_COIN_CONTROL_ADDRESS).unwrap();
+        evm.ctx_mut().journal_mut().load_account_mut_optional_code(NATIVE_COIN_CONTROL_ADDRESS, false).unwrap().storage.insert(blocklist_entry_slot, revm::state::EvmStorageSlot::new(U256::from(1)));
+
+        let tx = TxEnv {
+            caller: eoa,
+            kind: TxKind::Call(blocklisted_factory),
+            value: U256::ZERO,
+            gas_limit: 1_000_000,
+            gas_price: 0,
+            chain_id: Some(LOCAL_DEV.chain_id()),
+            ..Default::default()
+        };
+        let result = evm.transact_one(tx).expect("transact_one should succeed");
+
+        // Assert that the transaction was successful (CREATE executed successfully despite factory being blocklisted)
+        assert!(result.is_success(), "Transaction should succeed because ZERO value CREATE bypasses blocklist");
+
+        // Check if the created contract has an address that is not zero
+        let state = result.state().unwrap();
+        let expected_new_contract = blocklisted_factory.create(1); // factory nonce is 1
+
+        assert!(state.get(&expected_new_contract).is_some(), "New contract should be successfully created by the blocklisted factory");
+        assert!(
+            workspace_toml.contains(&expected),
+            "revm version has changed from {EXPECTED_REVM_VERSION}.              Review all forked/mirrored revm functions listed in this test's doc comment."
+        );
+    }
+
+    #[test]
+    fn test_zero_value_create_bypasses_blocklist() {
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+        use revm_primitives::TxKind;
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, 0),
+            (ArcHardfork::Zero4, 0),
+            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero6, 0),
+        ]);
+        let blocklisted_factory = address!("5555555555555555555555555555555555555555");
+        let eoa = address!("1111111111111111111111111111111111111111");
+
+        let factory_runtime: alloy_primitives::Bytes = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3
+        ].into();
+
+        let mut db = create_db(&[(eoa, 1000)]);
+        db.insert_account_info(
+            blocklisted_factory,
+            revm::state::AccountInfo {
+                balance: U256::from(0),
+                code_hash: revm_primitives::keccak256(&factory_runtime),
+                code: Some(revm_primitives::Bytecode::new_raw(factory_runtime.clone())),
+                nonce: 1,
+            },
+        );
+
+        // Blocklist the factory
+        let blocklist_entry_slot = arc_precompiles::native_coin_control::blocklisted_address_slot(blocklisted_factory);
+        db.insert_account_info(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: revm_primitives::KECCAK_EMPTY,
+                code: None,
+            },
+        );
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            blocklist_entry_slot,
+            U256::from(1),
+        ).unwrap();
+
+        let mut evm = setup_test_evm_with_db(db, &[], &[]);
+
+        let tx = TxEnv {
+            caller: eoa,
+            kind: TxKind::Call(blocklisted_factory),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            gas_price: 1,
+            chain_id: Some(chain_spec.chain_id()),
+            ..Default::default()
+        };
+
+        let result = evm.transact_one(tx).expect("transact_one should succeed");
+        assert!(
+            result.is_success(),
+            "Outer transaction should succeed; ZERO value CREATE bypasses blocklist, got {:?}",
+            result
+        );
+
+        let state = result.state().unwrap();
+        let expected_new_contract = blocklisted_factory.create(1); // factory nonce is 1
+
+        assert!(state.get(&expected_new_contract).is_some(), "New contract should be successfully created by the blocklisted factory");
+        assert!(
+            workspace_toml.contains(&expected),
+            "revm version has changed from {EXPECTED_REVM_VERSION}.              Review all forked/mirrored revm functions listed in this test's doc comment."
+        );
+    }
+
+    #[test]
+    fn test_zero_value_create_bypasses_blocklist() {
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+        use revm_primitives::{TxKind, Address, U256};
+        use revm::Database;
+        use arc_precompiles::native_coin_control::blocklisted_address_slot;
+        use revm::state::AccountInfo;
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, 0),
+            (ArcHardfork::Zero4, 0),
+            (ArcHardfork::Zero5, 0),
+        ]);
+        let blocklisted_factory = address!("5555555555555555555555555555555555555555");
+        let eoa = address!("1111111111111111111111111111111111111111");
+
+        let factory_runtime: alloy_primitives::Bytes = vec![
+            // PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 CREATE
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0
+        ].into();
+
+        let mut db = create_db(&[(eoa, 1_000_000)]);
+        db.insert_account_info(
+            blocklisted_factory,
+            AccountInfo {
+                balance: U256::from(100),
+                code_hash: revm_primitives::keccak256(&factory_runtime),
+                code: Some(revm_primitives::Bytecode::new_raw(factory_runtime.clone())),
+                nonce: 1,
+            },
+        );
+
+        let mut evm = revm::Evm::builder()
+            .with_db(db)
+            .build();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+        let mut precompile_map = ArcPrecompileProvider::create_precompiles_map(chain_spec.spec_id(), flags.clone());
+        let mut arc_evm = ArcEvm {
+            inner: ArcEvmInner {
+                frame_stack: revm::handler::FrameStack::new(),
+                ctx: evm.context.evm,
+                precompiles: precompile_map,
+            },
+            spec_id: chain_spec.spec_id(),
+            hardfork_flags: flags,
+            subcall_continuations: std::collections::HashMap::new(),
+            subcall_registry: std::sync::Arc::new(crate::subcall::SubcallRegistry::new()),
+        };
+
+        let blocklist_entry_slot = blocklisted_address_slot(blocklisted_factory);
+        arc_evm.inner.ctx.journaled_state.load_account(NATIVE_COIN_CONTROL_ADDRESS, arc_evm.inner.ctx.db).unwrap();
+        arc_evm.inner.ctx.journaled_state.touch(&NATIVE_COIN_CONTROL_ADDRESS);
+
+        let (acc, _) = arc_evm.inner.ctx.journaled_state.load_account(NATIVE_COIN_CONTROL_ADDRESS, arc_evm.inner.ctx.db).unwrap();
+        acc.storage.insert(blocklist_entry_slot, revm::state::EvmStorageSlot::new(U256::from(1)));
+
+        let tx = TxEnv {
+            caller: eoa,
+            kind: TxKind::Call(blocklisted_factory),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            gas_price: 1,
+            chain_id: Some(chain_spec.chain_id()),
+            ..Default::default()
+        };
+
+        let result = arc_evm.transact_one(tx).expect("nested CREATE should execute");
+        assert!(
+            result.is_success(),
+            "Outer transaction should succeed; ZERO value CREATE bypasses blocklist, got {:?}",
+            result
+        );
+        assert!(
+            workspace_toml.contains(&expected),
+            "revm version has changed from {EXPECTED_REVM_VERSION}.              Review all forked/mirrored revm functions listed in this test's doc comment."
+        );
+    }
+
+    #[test]
+    fn test_zero_value_create_bypasses_blocklist() {
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+        use revm_primitives::TxKind;
+
+        let blocklisted_factory = address!("5555555555555555555555555555555555555555");
+        let eoa = address!("1111111111111111111111111111111111111111");
+
+        let factory_runtime: alloy_primitives::Bytes = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3
+        ].into();
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, 0),
+            (ArcHardfork::Zero4, 0),
+            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero6, 0),
+        ]);
+
+        let mut db = create_db(&[(eoa, 1_000_000)]);
+        db.insert_account_info(
+            blocklisted_factory,
+            revm::state::AccountInfo {
+                balance: U256::from(0),
+                code_hash: revm_primitives::keccak256(&factory_runtime),
+                code: Some(revm_primitives::Bytecode::new_raw(factory_runtime.clone())),
+                nonce: 1,
+                ..Default::default()
+            },
+        );
+
+        let blocklist_entry_slot = arc_precompiles::native_coin_control::blocklisted_address_slot(blocklisted_factory);
+        db.insert_account_info(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            revm::state::AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash: revm_primitives::KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            },
+        );
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            blocklist_entry_slot,
+            U256::from(1),
+        ).unwrap();
+
+        let mut evm = setup_test_evm_with_db(db, &[], &[]);
+
+        let tx = TxEnv {
+            caller: eoa,
+            kind: TxKind::Call(blocklisted_factory),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            gas_price: 1,
+            chain_id: Some(chain_spec.chain_id()),
+            ..Default::default()
+        };
+
+        let result = evm.transact_one(tx).expect("transact_one should succeed");
+        assert!(
+            result.is_success(),
+            "Outer transaction should succeed; ZERO value CREATE bypasses blocklist, got {:?}",
+            result
+        );
+
+        let state = result.state().unwrap();
+        let expected_new_contract = blocklisted_factory.create(1);
+
+        assert!(state.get(&expected_new_contract).is_some(), "New contract should be successfully created by the blocklisted factory");
+    #[test]
+    fn test_zero_value_create_bypasses_blocklist() {
+        use arc_execution_config::{chainspec::localdev_with_hardforks, hardforks::ArcHardfork};
+        use revm_primitives::TxKind;
+
+        let chain_spec = localdev_with_hardforks(&[
+            (ArcHardfork::Zero3, 0),
+            (ArcHardfork::Zero4, 0),
+            (ArcHardfork::Zero5, 0),
+            (ArcHardfork::Zero6, 0),
+        ]);
+        let blocklisted_factory = address!("5555555555555555555555555555555555555555");
+        let eoa = address!("1111111111111111111111111111111111111111");
+
+        let factory_runtime: alloy_primitives::Bytes = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3
+        ].into();
+
+        let mut db = create_db(&[(eoa, 1_000_000)]);
+        db.insert_account_info(
+            blocklisted_factory,
+            revm::state::AccountInfo {
+                balance: U256::from(0),
+                code_hash: revm_primitives::keccak256(&factory_runtime),
+                code: Some(revm_primitives::Bytecode::new_raw(factory_runtime.clone())),
+                nonce: 1,
+            },
+        );
+
+        let blocklist_entry_slot = arc_precompiles::native_coin_control::blocklisted_address_slot(blocklisted_factory);
+        db.insert_account_storage(
+            NATIVE_COIN_CONTROL_ADDRESS,
+            blocklist_entry_slot,
+            U256::from(1),
+        ).unwrap();
+
+        // `create_db` and `db.insert_account_storage` are accessible. Let's manually construct `ArcEvm` using `Evm::builder().with_db(db).build()`.
+        let mut evm = revm::Evm::builder()
+            .with_db(db)
+            .build();
+
+        let flags = ArcHardforkFlags::with(&[ArcHardfork::Zero5]);
+
+        let mut arc_evm = ArcEvm {
+            inner: ArcEvmInner {
+                frame_stack: revm::handler::FrameStack::new(),
+                ctx: evm.context.evm,
+                precompiles: ArcPrecompileProvider::create_precompiles_map(chain_spec.spec_id(), flags.clone()),
+            },
+            hardfork_flags: flags,
+            subcall_continuations: std::collections::HashMap::new(),
+            subcall_registry: std::sync::Arc::new(crate::subcall::SubcallRegistry::new()),
+        };
+
+        let tx = TxEnv {
+            caller: eoa,
+            kind: TxKind::Call(blocklisted_factory),
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            gas_price: 1,
+            chain_id: Some(chain_spec.chain_id()),
+            ..Default::default()
+        };
+
+        // Initialize blocklist contract correctly
+        arc_evm.inner.ctx.journaled_state.load_account(NATIVE_COIN_CONTROL_ADDRESS, arc_evm.inner.ctx.db).unwrap();
+
+        let result = arc_evm.transact_one(tx).expect("transact_one should succeed");
+        assert!(
+            result.is_success(),
+            "Outer transaction should succeed; ZERO value CREATE bypasses blocklist, got {:?}",
+            result
+        );
+
+        let state = result.state().unwrap();
+        let expected_new_contract = blocklisted_factory.create(1); // factory nonce is 1
+
+        assert!(state.get(&expected_new_contract).is_some(), "New contract should be successfully created by the blocklisted factory");
+    }
+}
 }
