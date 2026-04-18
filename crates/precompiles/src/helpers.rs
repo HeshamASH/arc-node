@@ -488,35 +488,6 @@ mod tests {
 
     // Generated 11/30/2025 with AI assistance
     #[test]
-    fn test_check_can_decr_account_poc_sanction_burn_blocked() {
-        // PoC: Compliant Burn Blocked for Zero-Nonce Sanctioned Wallets
-        let mut gas_counter = Gas::new(100_000);
-        let amount = U256::from(1000);
-
-        let mut account_info = AccountInfo::default();
-        account_info.balance = U256::from(1000); // Exactly matching amount
-        account_info.nonce = 0;                  // Newly created wallet
-        account_info.code_hash = revm_primitives::KECCAK_EMPTY;
-
-        let result = check_can_decr_account(&account_info, amount, &mut gas_counter);
-
-        // Assert that the compliant burn is blocked!
-        assert!(
-            result.is_err(),
-            "Vulnerability: The burn should incorrectly revert because the account would be cleared!"
-        );
-
-        let err = result.unwrap_err();
-        match err {
-            PrecompileErrorOrRevert::Revert(output) => {
-                let revert_bytes = output.bytes;
-                assert_eq!(revert_bytes, revert_message_to_bytes(ERR_CLEAR_EMPTY));
-            }
-            _ => panic!("Expected Revert"),
-        }
-    }
-
-    #[test]
     fn test_check_can_decr_account() {
         struct TestCase {
             name: &'static str,

@@ -203,6 +203,24 @@ where
         self
     }
 
+    /// Prepend a vote with an invalid signature to include in the certificate
+    pub fn with_prepended_invalid_signature_vote(mut self, index: usize, vote_type: VoteType) -> Self {
+        if index < self.validators.len() {
+            let mut vote = block_on(self.signers[index].sign_vote(C::make_vote(
+                &self.ctx,
+                self.height,
+                self.round,
+                NilOrVal::Val(self.value_id),
+                vote_type,
+                self.validators[index].address,
+            )))
+            .unwrap();
+            vote.signature = Signature::test(); // Set an invalid signature
+            self.votes.insert(0, vote); // Prepend to the list
+        }
+        self
+    }
+
     /// Add nil votes to include in the certificate
     pub fn with_nil_votes(
         mut self,

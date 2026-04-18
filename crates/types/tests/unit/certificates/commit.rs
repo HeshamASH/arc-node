@@ -157,6 +157,21 @@ fn invalid_commit_certificate_invalid_signature_1() {
         });
 }
 
+/// Tests the verification of a valid certificate poisoned by prepending an invalid signature.
+#[test]
+fn test_poc_new17_bft_proof_poisoning_duplicate_vote() {
+    let validator_addr = {
+        let (validators, _) = make_validators([20, 20, 30, 30], DEFAULT_SEED);
+        validators[0].address
+    };
+
+    CertificateTest::<Commit>::new()
+        .with_validators([20, 20, 30, 30])
+        .with_votes(0..4, VoteType::Precommit) // Valid signatures for all
+        .with_prepended_invalid_signature_vote(0, VoteType::Precommit) // Attacker prepends invalid signature for Validator 0
+        .expect_error(CertificateError::DuplicateVote(validator_addr));
+}
+
 /// Tests the verification of a certificate with no votes.
 #[test]
 fn empty_commit_certificate() {

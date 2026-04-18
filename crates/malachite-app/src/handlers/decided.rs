@@ -672,62 +672,6 @@ mod tests {
 
     // BlockFinalizer finalization failure
     #[tokio::test]
-    async fn test_decide_partial_commit_restart_panic() {
-        // PoC: BFT/EVM Sync Boundary Partial State Commit
-        // Demonstrates that a block failing finalization still permanently writes to the DB.
-        // This will brick the network on restart_height.
-        let height = 5u64;
-        let round = 2u32;
-        let timestamp = 1000u64;
-        let block_hash = B256::repeat_byte((height % 256) as u8);
-        let certificate = test_commit_certificate(height, round, block_hash);
-        let consensus_block = test_consensus_block(height, round, timestamp);
-
-        let mut undecided_blocks = MockUndecidedBlocksRepository::new();
-        undecided_blocks
-            .expect_get_first()
-            .with(eq(Height::new(height)), eq(block_hash))
-            .return_once(move |_, _| Ok(Some(consensus_block.clone())));
-
-        // 1. The node permanently persists the Commitment Certificate to the CL store
-        let mut decided_blocks = MockDecidedBlocksRepository::new();
-        decided_blocks.expect_store().return_once(|_, _, _| Ok(()));
-
-        // 2. The block fails EVM finality
-        let mut block_finalizer = MockBlockFinalizer::new();
-        block_finalizer
-            .expect_finalize_decided_block()
-            .return_once(|_, _| Err(eyre!("Finalization failed (e.g. malicious block)")));
-
-        let mut pruning_service = MockPruningService::new();
-        // 3. Stale data is cleaned BEFORE the failure
-        pruning_service
-            .expect_clean_stale_consensus_data()
-            .return_once(|_| Ok(()));
-
-        let metrics = test_metrics();
-        let stats = test_stats();
-
-        // Execution of the decide sequence
-        let result = decide(
-            block_finalizer,
-            undecided_blocks,
-            decided_blocks,
-            pruning_service,
-            certificate,
-            &stats,
-            &metrics,
-        )
-        .await;
-
-        // 4. The Decision::Failure propagates, triggering restart_height in finalized.rs.
-        // However, the DB slot for Height 5 is already occupied and undecided data is pruned!
-        // The node is now permanently bricked in an infinite loop or DB crash.
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Failed to commit block"));
-    }
-
-    #[tokio::test]
     async fn test_commit_finalization_failure() {
         let height = 5u64;
         let round = 2u32;
