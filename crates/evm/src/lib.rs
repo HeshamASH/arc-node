@@ -32,3 +32,4 @@ mod subcall_test;
 
 // Re-export commonly used types
 pub use evm::{ArcEvm, ArcEvmConfig, ArcEvmFactory};
+mod poc_test;
