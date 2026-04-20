@@ -30,6 +30,7 @@ use revm::{
     interpreter::{interpreter::EthInterpreter, InitialAndFloorGas},
     state::EvmState,
 };
+use revm_context_interface::transaction::AuthorizationTr;
 use revm_primitives::TxKind;
 
 // Handler Implementation
@@ -63,15 +64,36 @@ where
 
     #[inline]
     fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
-        let ctx = evm.ctx();
-        let tx = ctx.tx();
-        let caller = tx.caller();
-        let tx_kind = tx.kind();
-        let tx_value = tx.value();
+        let caller: Address;
+        let tx_kind: TxKind;
+        let tx_value: U256;
+        let mut delegate_addresses = Vec::new();
+
+        {
+            let ctx = evm.ctx();
+            let tx = ctx.tx();
+            caller = tx.caller();
+            tx_kind = tx.kind().clone();
+            tx_value = tx.value();
+            for auth in tx.authorization_list() {
+                delegate_addresses.push(auth.address());
+                if let Some(authority) = auth.authority() {
+                    delegate_addresses.push(authority);
+                }
+            }
+        }
 
         evm.ctx_mut()
             .journal_mut()
             .load_account(NATIVE_COIN_CONTROL_ADDRESS)?;
+
+        for delegate_address in delegate_addresses {
+            let (is_blocklisted, _) = self.is_address_blocklisted(evm, delegate_address)?;
+            if is_blocklisted {
+                return Err(InvalidTransaction::Str(ERR_BLOCKED_ADDRESS.into()).into());
+            }
+        }
+
         self.check_blocklist(evm, caller, &tx_kind, tx_value)?;
 
         self.mainnet.pre_execution(evm)
