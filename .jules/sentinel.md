@@ -7,3 +7,8 @@
 **Vulnerability:** Similar to the `CREATE` bypass, `arc_network_selfdestruct_impl` in `crates/evm/src/opcode.rs` contains a vulnerability where blocklist checks (`check_selfdestruct_accounts`) are entirely skipped if the contract's balance is zero (`Some(balance) if !balance.is_zero()`). This allows a blocklisted contract to bypass compliance controls and execute `SELFDESTRUCT` to any target address, successfully destroying itself and clearing its state, which could be leveraged to evade state-level restrictions or manipulate contract deployment patterns (e.g., using `CREATE2` and `SELFDESTRUCT` cyclically).
 **Learning:** Security checks (like blocklist verification or address validation) must be enforced based on the *action* being performed (e.g., destroying a contract, transferring execution context) rather than solely relying on the presence of native value. A zero-value `SELFDESTRUCT` is still a privileged and impactful state transition.
 **Prevention:** Remove the `!balance.is_zero()` shortcut for blocklist and target validation in the `SELFDESTRUCT` opcode handler.
+
+## 2024-05-18 - [UPDATE] Audit Conclusion
+**Vulnerability:** TSTORE/TLOAD (EIP-1153) transient storage bypass and BFT Proof Poisoning investigation concluded.
+**Learning:** Evaluated BFT Proof Poisoning and transient storage handling. `transient_storage` correctly clears between transactions and failed blocks due to `ArcEvm`'s interaction with `revm::JournalInner::clear()`. `ProtocolConfig` Beneficiary Bypass, `alloy-sol-types` OOM, and `CallFrom`/`mintCall` Auth were also reviewed and determined safe by design or properly mitigated.
+**Prevention:** Maintained strict hygiene by removing unneeded tests and artifacts. Security audit on `arc-node` successfully completed.
