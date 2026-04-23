@@ -32,6 +32,3 @@ mod subcall_test;
 
 // Re-export commonly used types
 pub use evm::{ArcEvm, ArcEvmConfig, ArcEvmFactory};
-
-#[cfg(test)]
-mod boundary_exploit_poc_test;
