@@ -1,0 +1,4 @@
+## 2024-05-28 - BFT Proof Poisoning via State Leak (`seen_validators`)
+**Vulnerability:** In `malachitebft`'s `verify_commit_certificate`, `seen_validators.push(validator_address)` occurs *before* `verify_commit_signature`. An attacker can append a garbage signature for an honest validator to a valid certificate. The garbage signature fails verification but still poisons `seen_validators`, causing the subsequent real signature to be falsely rejected as a `DuplicateVote`.
+**Learning:** In consensus verification loops, state accumulators (like duplicate checkers) must never be updated until the cryptographic validity of the item is confirmed. Failing to do so allows attackers to inject invalid data that corrupts the validation state of honest data.
+**Prevention:** Always follow the strict order: Validate -> Authenticate -> Mutate State. Never push to `seen_validators` unless `verify_commit_signature` returns `Ok`.

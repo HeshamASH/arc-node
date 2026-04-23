@@ -191,3 +191,22 @@ fn commit_certificate_with_mixed_valid_and_invalid_votes() {
             expected: 67,
         });
 }
+
+#[test]
+fn invalid_commit_certificate_invalid_sig_poisons_seen_validators() {
+    let mut test = CertificateTest::<Commit>::new()
+        .with_validators([20, 20, 30, 30]);
+
+    // 1. Add an invalid signature for Validator 0.
+    test = test.with_invalid_signature_vote(0, VoteType::Precommit);
+
+    // 2. Add valid signatures for Validators 0..4
+    test = test.with_votes(0..4, VoteType::Precommit);
+
+    // Validator 0's address
+    let val_0_addr = test.validators[0].address;
+
+    // The test framework builds the certificate from `test.votes`.
+    // It verifies it. If it fails with DuplicateVote(val_0), the exploit is real.
+    test.expect_error(CertificateError::DuplicateVote(val_0_addr));
+}
