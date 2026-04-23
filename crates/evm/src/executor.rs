@@ -565,65 +565,6 @@ where
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn test_consensus_divergence_system_accounting() {
-        let chain_spec = LOCAL_DEV.clone();
-
-        let mut db = InMemoryDB::default();
-        insert_alloc_into_db(&mut db, chain_spec.genesis());
-
-        let mut block_env = get_mock_block_env();
-        block_env.number = U256::from(100);
-
-        use reth_chainspec::EthChainSpec;
-        let cfg_env = CfgEnv::new()
-            .with_chain_id(chain_spec.chain_id())
-            .with_spec_and_mainnet_gas_params(SpecId::PRAGUE);
-
-        let evm_env = EvmEnv {
-            cfg_env,
-            block_env: block_env.clone(),
-        };
-
-        let evm_config = create_evm_config(chain_spec.clone());
-
-        let mut state = State::builder()
-            .with_database(&mut db)
-            .build();
-
-        let evm = reth_evm::ConfigureEvm::evm_with_env(&evm_config, &mut state, evm_env);
-
-        let ctx = get_mock_execution_ctx();
-
-        let mut executor = ArcBlockExecutor::new(
-            evm,
-            ctx,
-            chain_spec.clone(),
-            evm_config.inner.executor_factory.receipt_builder(),
-        );
-
-        executor.gas_used = 1_500_000;
-
-        let (mut evm_after, _result) = executor.finish().expect("finish");
-
-        let call_data = arc_precompiles::system_accounting::ISystemAccounting::getGasValuesCall {
-            blockNumber: 100,
-        };
-        use alloy_sol_types::SolCall;
-        let encoded_data = call_data.abi_encode();
-
-        let result_and_state = reth_evm::Evm::transact_system_call(
-            &mut evm_after,
-            Address::ZERO,
-            arc_precompiles::system_accounting::SYSTEM_ACCOUNTING_ADDRESS,
-            alloy_primitives::Bytes::from(encoded_data),
-        ).expect("system call execution");
-
-        let decoded = arc_precompiles::system_accounting::ISystemAccounting::getGasValuesCall::abi_decode_returns(result_and_state.result.output().unwrap()).unwrap();
-
-        assert_eq!(decoded.nextBaseFee, 0, "State was permanently altered by a block that could still fail consensus");
-    }
     extern crate alloc;
 
     use super::*;

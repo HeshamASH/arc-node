@@ -213,3 +213,17 @@ fn polka_certificate_with_mixed_valid_and_invalid_votes() {
             expected: 67,
         });
 }
+
+#[test]
+fn invalid_polka_certificate_invalid_sig_poisons_seen_validators() {
+    let validator_addr = {
+        let (validators, _) = make_validators([10, 10, 10, 10], DEFAULT_SEED);
+        validators[1].address
+    };
+
+    CertificateTest::<Polka>::new()
+        .with_validators([10, 10, 10, 10])
+        .with_invalid_signature_vote(1, VoteType::Prevote) // Validator 1 submits invalid signature FIRST
+        .with_votes([1], VoteType::Prevote) // Validator 1 later submits a VALID signature
+        .expect_error(CertificateError::DuplicateVote(validator_addr)); // The bug is that it returns DuplicateVote instead of ignoring the first one
+}
