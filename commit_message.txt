@@ -1,0 +1,11 @@
+test: Prove BFT Proof Poisoning via State Leak
+
+In the `verify_commit_certificate` loop within `malachitebft/crates/signing/src/ext.rs`,
+the `seen_validators` array is updated before verifying the commit signature.
+If a signature is invalid, the validator is marked as seen, and a subsequent
+valid signature from the same validator will be erroneously rejected
+as a `DuplicateVote`.
+
+This PoC adds a unit test demonstrating the bug by passing an invalid
+signature followed by a valid signature for the same validator, which
+fails due to the `DuplicateVote` error.

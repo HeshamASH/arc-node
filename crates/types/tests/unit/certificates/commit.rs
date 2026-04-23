@@ -191,3 +191,20 @@ fn commit_certificate_with_mixed_valid_and_invalid_votes() {
             expected: 67,
         });
 }
+
+#[test]
+fn test_bft_proof_poisoning_via_state_leak() {
+    let test = CertificateTest::<Commit>::new()
+        .with_validators([10, 20, 30, 40]);
+
+    let val0_address = test.validators[0].address.clone();
+
+    test
+        .with_invalid_signature_vote(0, VoteType::Precommit) // Invalid signature for validator 0
+        .with_votes([0], VoteType::Precommit)                // Valid signature for validator 0 follows
+        .with_votes(1..4, VoteType::Precommit)               // Valid signatures for rest
+        .expect_error(CertificateError::DuplicateVote(
+            // Expecting it to fail with DuplicateVote for validator 0
+            val0_address
+        ));
+}
