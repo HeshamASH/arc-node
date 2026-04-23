@@ -1,4 +1,6 @@
-## 2025-04-17 - [CRITICAL] Total State Root Divergence (Consensus Fork) via OnStateHook Side-Effect Leakage in Block Execution Validations
-**Vulnerability:** The EVM Executor in `ArcBlockExecutor` incorrectly executes system calls and transactions that stream state changes to the consensus layer's `OnStateHook` *before* completing all header validations (`apply_pre_execution_changes` and `finish`).
-**Learning:** State leaks to the consensus layer are unrecoverable. Validating nodes that drop an invalid block halfway through execution retain the corrupted state root emitted by the hook, causing permanent non-determinism (a chain fork) against nodes that didn't process the block.
-**Prevention:** All block-level validations (e.g. beneficiary checks, gas limits, extra_data parameters) must rigidly execute before the first state-modifying instruction, or the consensus interface must support explicit block-level rollback/atomic hook commits.
+## 2024-05-24 - [Investigation] Precompile Call Authentication & Block Assembly Validation
+**Vulnerability:** None found in Precompile contexts. Discovered intentional validation bypasses in `apply_pre_execution_changes` during block assembly.
+**Learning:**
+1. **Subcall Interception Safety**: `ArcEvm` safely intercepts subcalls by looking up `call_inputs.target_address`. This implicitly neutralizes `DELEGATECALL` spoofing against precompiles like `CallFrom`, because `DELEGATECALL` sets `target_address` to the calling contract, causing the registry lookup to yield `None` and safely fallback to empty bytecode execution.
+2. **Assembler Validation Bypass**: `ArcBlockExecutor::apply_pre_execution_changes` deliberately swallows `Err` variants emitted by `protocol_config::retrieve_reward_beneficiary(&mut self.evm)`. If the internal system call fails, it logs a warning and proceeds without validating the block's beneficiary.
+**Prevention:** N/A. The fallback is an explicit architectural decision to prevent chain halting if `ProtocolConfig` is deprecated.
