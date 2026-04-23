@@ -157,21 +157,6 @@ fn invalid_commit_certificate_invalid_signature_1() {
         });
 }
 
-/// Tests the verification of a valid certificate poisoned by prepending an invalid signature.
-#[test]
-fn test_poc_new17_bft_proof_poisoning_duplicate_vote() {
-    let validator_addr = {
-        let (validators, _) = make_validators([20, 20, 30, 30], DEFAULT_SEED);
-        validators[0].address
-    };
-
-    CertificateTest::<Commit>::new()
-        .with_validators([20, 20, 30, 30])
-        .with_votes(0..4, VoteType::Precommit) // Valid signatures for all
-        .with_prepended_invalid_signature_vote(0, VoteType::Precommit) // Attacker prepends invalid signature for Validator 0
-        .expect_error(CertificateError::DuplicateVote(validator_addr));
-}
-
 /// Tests the verification of a certificate with no votes.
 #[test]
 fn empty_commit_certificate() {
@@ -205,4 +190,23 @@ fn commit_certificate_with_mixed_valid_and_invalid_votes() {
             total: 100,
             expected: 67,
         });
+}
+
+#[test]
+fn invalid_commit_certificate_invalid_sig_poisons_seen_validators() {
+    let mut test = CertificateTest::<Commit>::new()
+        .with_validators([20, 20, 30, 30]);
+
+    // 1. Add an invalid signature for Validator 0.
+    test = test.with_invalid_signature_vote(0, VoteType::Precommit);
+
+    // 2. Add valid signatures for Validators 0..4
+    test = test.with_votes(0..4, VoteType::Precommit);
+
+    // Validator 0's address
+    let val_0_addr = test.validators[0].address;
+
+    // The test framework builds the certificate from `test.votes`.
+    // It verifies it. If it fails with DuplicateVote(val_0), the exploit is real.
+    test.expect_error(CertificateError::DuplicateVote(val_0_addr));
 }
