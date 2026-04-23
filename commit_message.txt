@@ -1,9 +1,11 @@
-test: Prove AddressesDenylist bypass in EVM execution
+test: Prove BFT Proof Poisoning via State Leak
 
-The AddressesDenylist is exclusively enforced in the mempool validator.
-The EVM layer (ArcEvm/ArcEvmHandler) is unaware of this denylist, checking
-only the NativeCoinControl blocklist.
+In the `verify_commit_certificate` loop within `malachitebft/crates/signing/src/ext.rs`,
+the `seen_validators` array is updated before verifying the commit signature.
+If a signature is invalid, the validator is marked as seen, and a subsequent
+valid signature from the same validator will be erroneously rejected
+as a `DuplicateVote`.
 
-This allows any off-chain denylisted address to act as a sender
-or recipient during internal contract execution (e.g., via CallFrom).
-This PoC confirms the execution blindness.
+This PoC adds a unit test demonstrating the bug by passing an invalid
+signature followed by a valid signature for the same validator, which
+fails due to the `DuplicateVote` error.
