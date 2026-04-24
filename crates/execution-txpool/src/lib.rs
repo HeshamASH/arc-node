@@ -39,4 +39,3 @@ pub type ArcTransactionPool<Provider, BlobStore, Evm> = reth_transaction_pool::P
     CoinbaseTipOrdering<EthPooledTransaction>,
     BlobStore,
 >;
-mod poc_test;
