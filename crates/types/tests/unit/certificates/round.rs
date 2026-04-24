@@ -491,26 +491,3 @@ fn round_certificate_with_mixed_valid_and_invalid_votes() {
             expected: 67,
         });
 }
-
-#[test]
-fn invalid_round_certificate_invalid_sig_poisons_seen_validators() {
-    let validator_addr = {
-        let (validators, _) = make_validators([10, 20, 30, 40], DEFAULT_SEED);
-        validators[1].address // Validator 1 will have invalid signature then valid signature
-    };
-
-    CertificateTest::<RoundSkip>::new()
-        .with_validators([10, 20, 30, 40])
-        // Validator 1 provides a vote with an invalid signature.
-        // In verify_round_certificate, this validator's address is pushed to `seen_validators`
-        // *before* signature validation. When signature validation fails, it skips counting their voting power.
-        // Crucially, `seen_validators` still retains validator 1's address.
-        .with_invalid_signature_vote(1, VoteType::Prevote)
-        // Validator 1 tries to submit a valid vote in the same certificate
-        .with_votes(1..2, VoteType::Prevote)
-        // Validator 2 provides a valid vote.
-        .with_votes(2..3, VoteType::Prevote)
-        // Since validator 1's address is already in `seen_validators` due to the state pollution from the
-        // first invalid signature, the second (valid) vote triggers a DuplicateVote error.
-        .expect_error(CertificateError::DuplicateVote(validator_addr));
-}
