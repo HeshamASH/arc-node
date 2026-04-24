@@ -17,3 +17,6 @@
 //! arc-snapshots library — download and extract Arc node snapshots.
 
 pub mod download;
+
+#[cfg(test)]
+mod zip_bomb_poc_test;
