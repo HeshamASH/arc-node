@@ -1419,4 +1419,32 @@ mod tests {
         assert!(!dir.path().join("tmp").exists());
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_snapshot_extraction_lacks_verification_poc() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tmp_dir.path().join("dest");
+        let staging_dir = tmp_dir.path().join("staging");
+
+        let malicious_data = build_tar_lz4(&[("db/mdbx.dat", b"POISONED_STATE")]).unwrap();
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .insert_header("Content-Length", malicious_data.len().to_string().as_str())
+                .set_body_bytes(malicious_data))
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/snapshot.tar.lz4", mock_server.uri());
+        let dest_clone = dest_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            download_and_extract(&url, &dest_clone, &staging_dir)
+        }).await.unwrap();
+
+        assert!(result.is_ok(), "Extraction failed: {:?}", result.err());
+
+        let content = std::fs::read(dest_dir.join("db/mdbx.dat")).unwrap();
+        assert_ne!(content, b"POISONED_STATE", "SECURITY VULNERABILITY: Unverified malicious snapshot successfully downloaded and extracted!");
+    }
 }

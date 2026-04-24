@@ -1,99 +1,75 @@
+# 🛡️ Sentinel: [CRITICAL] Remote State Injection via Unverified Snapshot Extraction
+
+## Description
+🚨 **Severity**: CRITICAL
+💡 **Vulnerability**: A critical infrastructure vulnerability exists in `crates/snapshots/src/download.rs`. The snapshot downloader fetches execution layer (`mdbx.dat`) and consensus layer (`store.db`) databases from an external URL and extracts them directly to the node's disk. At no point in the `resumable_download`, `extract_archive`, or `download_and_extract_both` lifecycle is the snapshot cryptographically verified. There are no checks for file hashes, signatures, or state roots against a trusted consensus proof prior to extraction.
+🎯 **Impact**: An attacker who compromises the snapshot API, intercepts the connection (MITM), or spoofs the DNS/CDN can inject arbitrary, malicious blockchain state into the node. Since the node trusts the extracted database as its source of truth, this results in complete Remote State Injection. The attacker can arbitrarily alter balances, deploy malicious code, or spoof governance state, utterly breaking the security guarantees of the Arc Network for the affected node.
+🔧 **Fix**:
+1. The snapshot API must provide a cryptographic signature or hash (e.g., SHA256) of the archive.
+2. The `download_and_extract` process must download the archive, verify its integrity against a trusted root/signature, and only proceed to extraction if verification succeeds.
+*(Code Modification Note: As instructed, the fix is not applied to the source files.)*
+✅ **Verification**: Code review confirms the absence of cryptographic verification. A PoC can be demonstrated by serving a manipulated `.tar.lz4` archive containing altered databases via a mock HTTP server.
+
 ## CVSS 4.0 Assessment
-**Severity**: 10.0 (Critical)
+**Severity**: 9.5 (Critical)
 **Vector**: `CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H`
 
-### **Summary**
-The Arc Network features a system-wide blocklist (`NativeCoinControl`) to enforce regulatory compliance. The execution layer enforces these checks in `before_frame_init` during EVM processing. However, a critical vulnerability exists where the blocklist checks are completely bypassed for zero-value `CREATE` and `CREATE2` frames. Because `before_frame_init` only enforces the blocklist if `!amount.is_zero()`, a blocklisted address can successfully deploy new smart contracts via zero-value internal calls (e.g., using a factory contract). The newly deployed contract receives a clean, non-blocklisted address, allowing the sanctioned entity to use it as a proxy to bypass all restrictions and interact with the network freely.
+### **Metric Justification**
+- **Attack Vector: Network (AV:N)**: The exploit is executed remotely via network transport when the node initiates a snapshot download.
+- **Attack Complexity: Low (AC:L)**: The exploit involves standard MITM techniques, DNS spoofing, or API compromise, requiring no specialized race conditions.
+- **Attack Requirements: None (AT:N)**: The vulnerability is inherent in the snapshot download architecture.
+- **Privileges Required: None (PR:N)**: An unauthenticated attacker in a privileged network position can serve the malicious payload.
+- **User Interaction: None (UI:N)**: The node automatically syncs and extracts the data without user review of the contents.
+- **Vulnerable System Impact (VC:H, VI:H, VA:H)**:
+    - **Integrity (VI:H)**: Total compromise of the blockchain state database.
+    - **Confidentiality (VC:H)**: Full access to any local state or potential subsequent arbitrary code execution within the node environment.
+    - **Availability (VA:H)**: Complete denial of service; the node will serve false data or crash upon processing the poisoned state.
+- **Subsequent System Impact (SC:H, SI:H, SA:H)**: If the poisoned node acts as an RPC provider or bridge authority, the corrupted state will cascade into upstream DApps, off-chain indexers, and bridges relying on the node's execution integrity.
 
-### **Vulnerability Details**
-1. **Flawed Enforcement Logic**: In `crates/evm/src/evm.rs:491-511`, `before_frame_init` is responsible for checking the blocklist for nested frames:
+### **CWE Classifications**
+- **CWE-345: Insufficient Verification of Data Authenticity** (Primary)
+- **CWE-494: Download of Code Without Integrity Check**
+
+## References
+1. **Missing Verification Logic**: [`crates/snapshots/src/download.rs`](https://github.com/circlefin/arc-node/blob/main/crates/snapshots/src/download.rs)
+2. **Extraction without Checksum**: `extract_archive` in [`crates/snapshots/src/download.rs`](https://github.com/circlefin/arc-node/blob/main/crates/snapshots/src/download.rs)
+
+## Proof of Concept (PoC)
+To demonstrate the vulnerability, we can simulate an attacker intercepting the snapshot download request. Since there is no hash or signature verification, we can serve a forged `.tar.lz4` file containing a modified `mdbx.dat` (Execution Layer state).
+
+### Reproduction Steps
+1. The node initiates a sync and requests the latest snapshot URLs from `https://snapshots.arc.network/api`.
+2. An attacker intercepts the connection (or compromises the CDN) and serves a malicious `.tar.lz4` archive.
+3. The `download_and_extract` function streams the payload to a `.part` file using `reqwest` and immediately calls `extract_archive`.
+4. `extract_archive` uncompresses the `.tar.lz4` using `lz4::Decoder` and unpacks the modified `mdbx.dat` directly into the node's `execution` directory.
+5. The node restarts, loading the attacker's `mdbx.dat` containing fabricated balances and contract state, completely bypassing consensus validation.
+
 ```rust
-    pub(crate) fn before_frame_init(
-        &mut self,
-        frame_input: &FrameInit,
-    ) -> Result<BeforeFrameInitResult, ContextDbError<CTX>> {
-        // Extract transfer parameters based on frame type
-        let transfer_params = match &frame_input.frame_input {
-            FrameInput::Empty => None,
-            FrameInput::Create(inputs) => {
-                self.extract_create_transfer_params(inputs, frame_input.depth)?
-            }
-            FrameInput::Call(inputs) => extract_call_transfer_params(inputs),
-        };
+    #[tokio::test]
+    async fn test_snapshot_extraction_lacks_verification_poc() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tmp_dir.path().join("dest");
+        let staging_dir = tmp_dir.path().join("staging");
 
-        // Process transfer if present and non-zero
-        match transfer_params {
-            Some((from, to, amount)) if !amount.is_zero() => {
-                self.check_blocklist_and_create_log(from, to, amount, frame_input)
-            }
-            _ => Ok(BeforeFrameInitResult::None), // <--- BYPASS
-        }
+        let malicious_data = build_tar_lz4(&[("db/mdbx.dat", b"POISONED_STATE")]).unwrap();
+
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200)
+                .insert_header("Content-Length", malicious_data.len().to_string().as_str())
+                .set_body_bytes(malicious_data))
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/snapshot.tar.lz4", mock_server.uri());
+        let dest_clone = dest_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            download_and_extract(&url, &dest_clone, &staging_dir)
+        }).await.unwrap();
+
+        assert!(result.is_ok(), "Extraction failed: {:?}", result.err());
+
+        let content = std::fs::read(dest_dir.join("db/mdbx.dat")).unwrap();
+        assert_ne!(content, b"POISONED_STATE", "SECURITY VULNERABILITY: Unverified malicious snapshot successfully downloaded and extracted!");
     }
 ```
-2. **CREATE Extraction**: The `extract_create_transfer_params` explicitly returns the caller and the newly created address, along with the value (`inputs.value()`).
-3. **The Bypass**: If a blocklisted address (or a contract operating on its behalf) initiates a `CREATE` or `CREATE2` frame with `value = 0`, the `amount.is_zero()` condition is met. The `match` falls through to `_ => Ok(BeforeFrameInitResult::None)`, and the frame is executed without any blocklist checks. The blocklisted entity has successfully created a new, unblocklisted contract proxy.
-
-### **Impact**
-This represents a total failure of the network's compliance and security invariants. A blocklisted entity can indefinitely spawn new proxies to move assets, participate in governance, or interact with decentralized applications, rendering the blocklist completely ineffective.
-
-### **Fix**
-The `match` logic in `before_frame_init` must be updated to explicitly catch `CREATE` and `CREATE2` frames and enforce the blocklist check on the creator's address regardless of the `amount` attached.
-
-```rust
-        match transfer_params {
-            Some((from, to, amount)) => {
-                if !amount.is_zero() || matches!(frame_input.frame_input, FrameInput::Create(_)) {
-                    self.check_blocklist_and_create_log(from, to, amount, frame_input)
-                } else {
-                    Ok(BeforeFrameInitResult::None)
-                }
-            }
-            _ => Ok(BeforeFrameInitResult::None),
-        }
-```
-*(Code Modification Note: As instructed, the fix is not applied to the source files.)*
-
-### **Verification**
-To verify, deploy a smart contract that acts as a factory using `CREATE`. Add an address to the blocklist. Have the blocklisted address invoke the factory with `value = 0`. The factory will successfully deploy a new contract on behalf of the blocklisted user, bypassing the compliance controls.
-
-## Sentinel Additional Finding: EVM-SELFDESTRUCT Blocklist Bypass
-During the investigation of the `before_frame_init` blocklist bypass, Sentinel has identified another critical instance of "Value Control" erroneously replacing "Entity Control" within the EVM execution layer.
-
-In `crates/evm/src/opcode.rs`, the `arc_network_selfdestruct_impl` function is responsible for handling the `SELFDESTRUCT` opcode. However, the blocklist validation (`check_selfdestruct_accounts`) and zero-address validation are placed inside a `match` arm that requires `!balance.is_zero()`:
-
-```rust
-    let is_cold = match addr_balance.clone() {
-        Some(balance) if !balance.is_zero() => { // <--- BYPASS for 0-value
-            // Zero5: reject SELFDESTRUCT to zero address (prevents burn-like semantics)
-            if matches!(log_mode, Some(TransferLogMode::Eip7708Transfer))
-                && target == alloy_primitives::Address::ZERO
-            {
-                // ... Revert
-            }
-
-            // Checks the source and target account is valid or not.
-            let Ok(is_target_cold) = check_selfdestruct_accounts(
-                &mut context,
-                addr,
-                target,
-                skip_cold_load,
-                check_target_destructed,
-            ) else {
-                return;
-            };
-
-            is_target_cold
-        }
-        None => { // ... }
-        _ => None, // <--- 0-balance falls through here, skipping ALL checks!
-    };
-
-    let res = match context
-        .host
-        .selfdestruct( ... ) // <--- Execution proceeds
-```
-
-Because of this shortcut, a blocklisted contract with a balance of `0` can successfully invoke `SELFDESTRUCT` targeting *any* address, completely bypassing the compliance checks. This allows sanctioned entities to clear state and potentially execute `CREATE2` and `SELFDESTRUCT` cycling attacks.
-
-### **Fix for SELFDESTRUCT**
-The `check_selfdestruct_accounts` function must be called unconditionally on the `SELFDESTRUCT` opcode, regardless of whether the contract currently holds any native coin balance.

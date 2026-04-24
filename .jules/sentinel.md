@@ -12,3 +12,8 @@
 **Vulnerability:** TSTORE/TLOAD (EIP-1153) transient storage bypass and BFT Proof Poisoning investigation concluded.
 **Learning:** Evaluated BFT Proof Poisoning and transient storage handling. `transient_storage` correctly clears between transactions and failed blocks due to `ArcEvm`'s interaction with `revm::JournalInner::clear()`. `ProtocolConfig` Beneficiary Bypass, `alloy-sol-types` OOM, and `CallFrom`/`mintCall` Auth were also reviewed and determined safe by design or properly mitigated.
 **Prevention:** Maintained strict hygiene by removing unneeded tests and artifacts. Security audit on `arc-node` successfully completed.
+
+## 2024-05-18 - [CRITICAL] Remote State Injection via Unverified Snapshot Extraction
+**Vulnerability:** The snapshot downloader in `crates/snapshots/src/download.rs` fetches and extracts execution (`mdbx.dat`) and consensus (`store.db`) databases without any cryptographic verification. The downloaded `.tar.lz4` archives are streamed to disk and decompressed immediately, lacking checksum validation, signature verification, or state root checks against a trusted consensus proof. This allows an attacker to inject arbitrary state into the node via MITM or compromised infrastructure.
+**Learning:** Any bulk data downloaded from external infrastructure (like state snapshots) must be cryptographically verified *before* extraction. Blindly trusting CDN-hosted binaries or archives completely bypasses the consensus layer's security model.
+**Prevention:** Implement strict cryptographic verification (e.g., verifying a signed SHA256 manifest) immediately after downloading the snapshot and abort extraction if the checksum fails.
