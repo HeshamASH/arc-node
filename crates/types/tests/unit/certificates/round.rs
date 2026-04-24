@@ -491,3 +491,19 @@ fn round_certificate_with_mixed_valid_and_invalid_votes() {
             expected: 67,
         });
 }
+
+/// Tests that an invalid signature poisons the seen_validators tracking,
+/// causing a subsequent valid signature from the same validator to be rejected.
+#[test]
+fn invalid_round_certificate_invalid_sig_poisons_seen_validators() {
+    let validator_addr = {
+        let (validators, _) = make_validators([10, 10, 10, 10], DEFAULT_SEED);
+        validators[1].address
+    };
+
+    CertificateTest::<RoundPrecommit>::new()
+        .with_validators([10, 10, 10, 10])
+        .with_invalid_signature_vote(1, VoteType::Precommit)
+        .with_votes([1], VoteType::Precommit)
+        .expect_error(CertificateError::DuplicateVote(validator_addr));
+}
