@@ -1,55 +1,65 @@
-# Audit Report: P2P Block Synchronization Logic (`crates/sync/src/handle.rs`)
+# [High] Resource Exhaustion via Unbounded Concurrent ValueRequests in P2P Sync
 
-This report addresses the security audit for the P2P Block Synchronization logic in Malachite (`crates/sync/src/handle.rs`), focusing strictly on the network sync components.
+## Description
+A critical resource exhaustion vulnerability exists in the P2P Block Synchronization logic (`crates/sync/src/handle.rs`) of the Malachite consensus engine. A malicious peer can overwhelm the node by spamming an unbounded number of concurrent `ValueRequest` messages, causing the node to continuously queue expensive database read operations and exhaust memory, ultimately leading to a Denial of Service (DoS) and node crash.
 
-## 1. Amplification / Resource Exhaustion
-**Finding:** Unbounded Concurrent Request Spam
-**Impact:** Denial of Service (DoS) / Resource Exhaustion
-
-**Analysis:**
-A single malicious `SyncRequest` cannot force the node to load millions of blocks because `validate_request_range` strictly bounds the request size to the configured `batch_size`:
+In the P2P synchronization architecture, when a peer requests blocks via a `ValueRequest`, the network actor routes the request to the `on_value_request` function in `handle.rs`. The handler successfully validates the bounds of each individual request (ensuring that a single request does not ask for more blocks than `batch_size`). However, there is no state-tracking mechanism to limit the **volume** or **concurrency** of inbound requests originating from a single peer.
 
 ```rust
-let len = (range.end().as_u64() - range.start().as_u64()).saturating_add(1) as usize;
-if len > batch_size {
-    warn!("Received request for too many values...");
-    return false;
+// In `crates/sync/src/handle.rs`
+pub async fn on_value_request<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    request_id: InboundRequestId,
+    peer_id: PeerId,
+    request: ValueRequest<Ctx>,
+) -> Result<(), Error<Ctx>> {
+    // Validates that the request size <= batch_size, but DOES NOT rate limit
+    // or check how many requests are currently inflight for `peer_id`.
+    if !validate_request_range::<Ctx>(&request.range, state.tip_height, state.config.batch_size) { ... }
+
+    // Blindly issues a database read request for every validated message.
+    perform!(
+        co,
+        Effect::GetDecidedValues(request_id, range, Default::default())
+    );
+
+    Ok(())
 }
 ```
 
-However, the sync actor `on_value_request` does **not** implement rate limiting or cap the maximum number of concurrent inbound requests per peer. A malicious peer can continuously spam thousands of concurrently valid `ValueRequest` messages (each requesting `batch_size` blocks). For each request, the sync actor blindly emits `Effect::GetDecidedValues`, commanding the database to load the blocks into memory. This will rapidly exhaust memory (OOM), overwhelm the database actor, and saturate outbound bandwidth when the node attempts to reply with thousands of `ValueResponse` packets.
+Because `handle.rs` operates asynchronously, a malicious peer can establish a connection and fire hundreds of thousands of valid, small `ValueRequest` messages in rapid succession. For every message, the sync actor emits an `Effect::GetDecidedValues` back to the host application.
 
-## 2. Validation Bypass
-**Finding:** Zero Cryptographic Validation in Network Actor
-**Impact:** Spoofing / Network Layer Bypass
+This behavior results in two fatal resource exhaustion vectors:
+1. **Database Flood:** The host application is flooded with synchronous or heavy I/O requests to load blocks from disk, completely saturating database read capacity and starving other critical node operations (like block processing or mempool validation).
+2. **Memory Exhaustion (OOM):** The requested blocks are loaded into memory and buffered for the `GotDecidedValues` callback to be dispatched over the network. Processing an unbounded number of inflight requests causes the node to allocate memory continuously until it crashes with an Out-of-Memory (OOM) exception.
 
-**Analysis:**
-When syncing headers and values from peers, `handle.rs` (in `on_valid_value_response` and `on_value_response`) performs purely superficial boundary checks:
+## Impact
+A single unauthenticated, malicious peer can completely disable the node by causing a Denial of Service (DoS) via resource exhaustion. This disrupts network liveness, block production, and validation on the affected node.
 
-```rust
-let is_valid = start.as_u64() == requested_range.start().as_u64()
-    && start.as_u64() <= end.as_u64()
-    && end.as_u64() <= requested_range.end().as_u64()
-    && response.values.len() as u64 == range_len;
-```
+## CVSS Assessment
+**Severity:** High
+**CVSS Vector:** CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H (Score: 7.5)
+- **Attack Vector (AV):** Network (Exploitable over the P2P layer).
+- **Attack Complexity (AC):** Low (The attacker only needs to send repeated valid P2P messages).
+- **Privileges Required (PR):** None (Any peer can send sync requests).
+- **Availability (A):** High (Exhausts system memory and DB resources, causing node crash/unresponsiveness).
 
-It does not check if the blocks are sequential, nor does it verify parent hashes or certificate signatures. Instead, it blindly trusts the response structure and forwards it to the consensus engine via `Effect::ProcessValueResponse`. While it is architecturally common to delegate cryptographic checks to the consensus engine, the total lack of basic sanity checks (e.g., verifying `response.values[0].height == start`) at the network layer means malicious peers can flood the consensus engine with cryptographically invalid garbage, forcing the node to perform expensive signature verification on entirely fake chains.
+## Recommended Mitigation
+The synchronization `State` struct must track the number of active/inflight inbound requests per peer to prevent unbounded queueing.
 
-## 3. Deadlocks and Infinite Loops
-**Finding:** Sybil Sync Stalling
-**Impact:** Liveness Degradation
-
-**Analysis:**
-There are no true infinite `while` loops or deadlocks involving asynchronous locks in `handle.rs`. The partial response handler correctly avoids infinite looping because it ensures `values_count` is `> 0` before updating the request boundaries.
-
-However, a sync stalling condition exists. If a node receives an invalid response (e.g., from an attacker) or encounters a processing error, it calls `re_request_values_from_peer_except`. If the node only has a few peers and the attacker occupies those slots (Sybil attack), or if alternative peers are unavailable, `random_peer_with_except` will return `None`.
+1. **Track Inflight Requests:** Add a mapping to the `State` struct to track active requests: `inbound_requests: HashMap<PeerId, usize>`.
+2. **Enforce Concurrency Limits:** In `on_value_request`, check if the peer has exceeded a sane concurrent threshold (e.g., max 5 inflight requests). If they have, immediately drop the incoming `ValueRequest` or penalize the peer.
+3. **Decrement Counter:** When `Input::GotDecidedValues` is processed and the response is sent back to the peer, decrement the active request counter for that `PeerId`.
 
 ```rust
-let Some((peer, peer_range)) = state.random_peer_with_except(&range, except_peer_id) else {
-    debug!("No peer to re-request sync from");
-    state.sync_height = min(state.sync_height, *range.start());
+// Proposed fix inside `on_value_request`
+let inflight = state.inbound_requests.entry(peer_id).or_insert(0);
+if *inflight >= MAX_CONCURRENT_INBOUND_REQUESTS {
+    warn!(%peer_id, "Peer exceeded maximum concurrent value requests");
+    // Optionally penalize peer: state.peer_scorer.update_score(peer_id, SyncResult::Failure);
     return Ok(());
-};
+}
+*inflight += 1;
 ```
-
-When this happens, the node silently resets its `sync_height` backwards and aborts the request loop. If the attacker repeatedly triggers invalid responses and dominates the peer list, the node will permanently rollback its `sync_height` and stall, never syncing the actual chain.
