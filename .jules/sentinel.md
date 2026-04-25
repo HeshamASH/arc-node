@@ -1,0 +1,4 @@
+## 2025-04-25 - Critical Consensus Halt via Unbounded Equivocation Evidence (CPU/OOM DoS)
+**Vulnerability:** Found an $O(N^2)$ CPU and $O(N)$ memory exhaustion vulnerability in `EvidenceMap::add`. The system stored all unique pairs of equivocating votes by iterating over the existing list linearly on every insertion. An attacker broadcasting millions of spam equivocations would freeze the event loop and crash the node.
+**Learning:** MalachiteBFT does not drop subsequent equivocating votes for the same round/validator, allowing infinite amplification vectors. A single DoubleVote is mathematically sufficient to prove fault and slash a validator, rendering subsequent parsing both useless and dangerous.
+**Prevention:** Cap the `EvidenceMap` evidence vector to a length of 1 per validator/round. Once equivocation is proven, immediately return and discard further votes to eliminate the O(N) operations and memory allocations.
