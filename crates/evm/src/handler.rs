@@ -89,15 +89,9 @@ where
         let beneficiary = ctx.block().beneficiary();
         let basefee = ctx.block().basefee() as u128;
         let effective_gas_price = ctx.tx().effective_gas_price(basefee);
-        let gas_used = exec_result.gas().spent() - exec_result.gas().refunded() as u64;
+        let gas_used = exec_result.gas().used();
 
-        let mut total_fee_amount = U256::from(effective_gas_price) * U256::from(gas_used);
-
-        let blob_gas_used = ctx.tx().total_blob_gas();
-        if blob_gas_used > 0 {
-            let blob_fee = ctx.block().blob_gasprice().unwrap_or(0);
-            total_fee_amount += U256::from(blob_fee) * U256::from(blob_gas_used);
-        }
+        let total_fee_amount = U256::from(effective_gas_price) * U256::from(gas_used);
 
         // Transfer the total fee to the beneficiary (both base fee and priority fee)
         evm.ctx_mut()

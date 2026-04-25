@@ -367,6 +367,11 @@ where
             .chain_spec
             .is_fork_active_at_block(ArcHardfork::Zero5, block_number)
         {
+            // EIP-2935: persist parent block hash in history storage contract.
+            // Internally gates on Prague activation and is a no-op at block 0 (genesis).
+            self.system_caller
+                .apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
+
             let header_beneficiary = self.evm.block().beneficiary();
             if let Ok(expected_beneficiary) = protocol_config::retrieve_reward_beneficiary(&mut self.evm)
                 .inspect_err(|error| {
@@ -411,12 +416,6 @@ where
                     ),
                 ));
             }
-
-            // EIP-2935: persist parent block hash in history storage contract.
-            // Internally gates on Prague activation and is a no-op at block 0 (genesis).
-            // Do this ONLY after all validation to avoid polluting the state
-            self.system_caller
-                .apply_blockhashes_contract_call(self.ctx.parent_hash, &mut self.evm)?;
         }
 
         Ok(())
